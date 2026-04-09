@@ -1,0 +1,2 @@
+[console_scripts]
+ada-platform = ada_platform.cli.main:cli

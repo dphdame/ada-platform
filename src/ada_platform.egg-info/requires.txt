@@ -1,0 +1,9 @@
+python-docx>=1.1
+lxml>=5.0
+openpyxl>=3.1
+click>=8.1
+streamlit>=1.30
+
+[dev]
+pytest>=8.0
+pytest-cov
