@@ -16,6 +16,7 @@ from ada_platform.reporting.exception_report import (
     generate_scan_text_report,
 )
 from ada_platform.qa.screen_reader_sim import generate_transcript
+from ada_platform.qa.transcript_verifier import verify_transcript
 
 
 def main():
@@ -126,8 +127,30 @@ def main():
         with st.expander("Full screen reader transcript"):
             st.text(sr_transcript.text_only)
 
-        # Step 6: Download
-        st.header("Step 6: Download")
+        # Step 6: Transcript Verification (QI)
+        st.header("Step 6: Transcript Verification")
+        verification = verify_transcript(output_path)
+        if verification.passed and verification.gap_count == 0:
+            st.success(verification.summary())
+        elif verification.passed:
+            st.warning(verification.summary())
+        else:
+            st.error(verification.summary())
+
+        with st.expander("Verification details"):
+            if verification.issues:
+                for issue in verification.issues:
+                    icon = "X" if issue.severity == "error" else "?"
+                    st.markdown(
+                        f"- **[{icon}] {issue.element}** ({issue.location})\n"
+                        f"  - Expected: {issue.expected}\n"
+                        f"  - Found: {issue.found}"
+                    )
+            else:
+                st.markdown("Every element in the document matches the transcript.")
+
+        # Step 7: Download
+        st.header("Step 7: Download")
         col1, col2, col3 = st.columns(3)
         with col1:
             with open(output_path, "rb") as f:

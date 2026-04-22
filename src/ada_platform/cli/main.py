@@ -17,6 +17,7 @@ from ada_platform.reporting.exception_report import (
     generate_scan_text_report,
 )
 from ada_platform.qa.screen_reader_sim import generate_transcript
+from ada_platform.qa.transcript_verifier import verify_transcript
 
 
 @click.group()
@@ -173,6 +174,22 @@ def transcript(file_path: str):
         click.echo(f"\nWarnings ({len(t.warnings)}):")
         for w in t.warnings:
             click.echo(f"  [{w.location}] {w.text}")
+
+
+@cli.command()
+@click.argument("file_path", type=click.Path(exists=True))
+def verify(file_path: str):
+    """Verify that the screen reader transcript matches the document.
+
+    Independently reads the DOCX and compares every element against
+    the transcript to catch missing, wrong, or out-of-order content.
+    """
+    report = verify_transcript(file_path)
+    click.echo(report.full_report())
+    if report.passed:
+        raise SystemExit(0)
+    else:
+        raise SystemExit(1)
 
 
 @cli.command()
