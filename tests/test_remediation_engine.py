@@ -12,6 +12,7 @@ from ada_platform.qa.screen_reader_sim import generate_transcript
 from ada_platform.qa.transcript_verifier import verify_transcript
 from ada_platform.remediation_engine import (
     ADEC_NS,
+    REQUIRED_PDF_AUDIT_CHECKS,
     WP_NS,
     InteractiveRemediationPlan,
     apply_interactive_remediation,
@@ -62,6 +63,42 @@ class TestColorContrastEngine:
     def test_recommend_accessible_fg(self):
         assert recommend_accessible_fg("#FFFFFF") == "#000000"
         assert recommend_accessible_fg("#3E5872") == "#FFFFFF"
+
+    def test_small_heading_requires_4_5_contrast_threshold(self, tmp_path):
+        """A small heading (<14pt bold / <18pt regular) must require 4.5:1, not 3.0:1."""
+        doc = Document()
+        doc.core_properties.title = "Small Heading Contrast Test"
+        h3 = doc.add_heading("", level=3)
+        r = h3.add_run("Small 12pt bold heading with 3.54:1 gray")
+        r.font.size = Pt(12)
+        r.font.bold = True
+        r.font.color.rgb = RGBColor(0x88, 0x88, 0x88)  # 3.54:1 on white (< 4.5:1)
+
+        items = audit_color_contrast(doc)
+        h3_items = [i for i in items if i.role == "Heading 3"]
+        assert len(h3_items) == 1
+        assert h3_items[0].required_ratio == 4.5
+        assert h3_items[0].passed is False
+
+    def test_table_cell_second_run_low_contrast_is_caught(self, tmp_path):
+        """A later low-contrast run inside a table cell must be evaluated and flagged."""
+        doc = Document()
+        doc.core_properties.title = "Table Multi-Run Contrast Test"
+        tbl = doc.add_table(rows=2, cols=1)
+        tbl.cell(0, 0).text = "Header"
+        p_cell = tbl.cell(1, 0).paragraphs[0]
+        r_good = p_cell.add_run("High contrast first run ")
+        r_good.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
+        r_good.font.size = Pt(11)
+        r_bad = p_cell.add_run("(low contrast second run)")
+        r_bad.font.color.rgb = RGBColor(0xBB, 0xBB, 0xBB)  # 1.92:1 on white
+        r_bad.font.size = Pt(11)
+
+        items = audit_color_contrast(doc)
+        failing = [i for i in items if not i.passed]
+        assert len(failing) == 1
+        assert failing[0].fg_hex == "#BBBBBB"
+        assert failing[0].required_ratio == 4.5
 
 
 class TestInteractiveRemediationRoundTrip:
@@ -274,3 +311,53 @@ class TestInteractiveRemediationRoundTrip:
         assert gate["passed"] is False
         assert len(gate["blocking_reasons"]) == 4
         assert "BLOCKED" in gate["status_label"]
+
+        # 4. Deliverable gate rejects an incomplete 15-check set even if all_passed=True
+        class CleanScan:
+            total_issues = 0
+
+        class CleanSR:
+            warnings = []
+
+        class CleanVer:
+            passed = True
+            gap_count = 0
+
+            def summary(self):
+                return "PASS"
+
+        incomplete_15_report = {
+            "all_passed": True,
+            "critical_failures": 0,
+            "warnings": 0,
+            "checks": [
+                {"check": name, "passed": True, "detail": "ok", "severity": "critical"}
+                for name in REQUIRED_PDF_AUDIT_CHECKS[:-1]
+            ],
+        }
+        gate_incomplete = evaluate_deliverable_gate(
+            CleanScan(), CleanSR(), CleanVer(), incomplete_15_report
+        )
+        assert gate_incomplete["passed"] is False
+        assert any("missing 1 required check" in r for r in gate_incomplete["blocking_reasons"])
+
+        # 5. Deliverable gate rejects spoofed all_passed=True when any required check is False
+        spoofed_report = {
+            "all_passed": True,
+            "critical_failures": 0,
+            "warnings": 0,
+            "checks": [
+                {
+                    "check": name,
+                    "passed": (name != "Table headers (TH cells)"),
+                    "detail": "test",
+                    "severity": "critical",
+                }
+                for name in REQUIRED_PDF_AUDIT_CHECKS
+            ],
+        }
+        gate_spoofed = evaluate_deliverable_gate(
+            CleanScan(), CleanSR(), CleanVer(), spoofed_report
+        )
+        assert gate_spoofed["passed"] is False
+        assert any("Table headers (TH cells)" in r for r in gate_spoofed["blocking_reasons"])

@@ -208,8 +208,47 @@ def _extract_style_size_pt(doc: Document, style_name: str, default_pt: float = 1
     return default_pt
 
 
+def _extract_style_bold(doc: Document, style_name: str) -> bool:
+    """Look up whether a Word style is bold by default (without assuming all Headings are bold)."""
+    try:
+        style = doc.styles[style_name]
+    except KeyError:
+        return False
+    while style is not None:
+        if hasattr(style, "font") and style.font and style.font.bold is not None:
+            return bool(style.font.bold)
+        el = getattr(style, "element", None)
+        if el is not None:
+            rpr = el.find(f"{{{W_NS}}}rPr")
+            if rpr is not None:
+                b_el = rpr.find(f"{{{W_NS}}}b")
+                if b_el is not None:
+                    val = b_el.get(f"{{{W_NS}}}val", "true").lower()
+                    return val not in ("0", "false", "off")
+        style = getattr(style, "base_style", None)
+    return False
+
+
+def _extract_run_bg(r_el: etree._Element, default_bg: str) -> str:
+    """Extract run-level shading fill if present on w:rPr/w:shd, else return default_bg."""
+    rpr = r_el.find(f"{{{W_NS}}}rPr")
+    if rpr is not None:
+        shd = rpr.find(f"{{{W_NS}}}shd")
+        if shd is not None:
+            fill = shd.get(f"{{{W_NS}}}fill", "")
+            if fill and fill.lower() not in ("auto", "clear", "none"):
+                return normalize_hex(fill, default_bg)
+    return default_bg
+
+
 def audit_color_contrast(doc: Document) -> list[ColorContrastItem]:
-    """Audit all text/background color pairs across paragraphs, links, and tables."""
+    """Audit all text/background color pairs across every visible run in paragraphs, links, and tables.
+
+    Evaluates each visible run against its actual effective font size, bold weight,
+    foreground color, and background fill. Large text (3.0:1 threshold) applies
+    only when effective font_size_pt >= 18.0 or (font_size_pt >= 13.0 and is_bold),
+    never merely from the style name.
+    """
     grouped: dict[tuple[str, str, str, bool], ColorContrastItem] = {}
 
     def _record(
@@ -223,11 +262,7 @@ def audit_color_contrast(doc: Document) -> list[ColorContrastItem]:
     ) -> None:
         fg = normalize_hex(fg_hex, "#000000")
         bg = normalize_hex(bg_hex, "#FFFFFF")
-        is_large = (
-            font_size_pt >= 18.0
-            or (font_size_pt >= 13.0 and is_bold)
-            or role.startswith("Heading")
-        )
+        is_large = font_size_pt >= 18.0 or (font_size_pt >= 13.0 and is_bold)
         req = 3.0 if is_large else 4.5
         key = (role, fg, bg, is_large)
         if key in grouped:
@@ -253,7 +288,7 @@ def audit_color_contrast(doc: Document) -> list[ColorContrastItem]:
             occurrences=1,
         )
 
-    # 1. Body paragraphs & hyperlinks
+    # 1. Body paragraphs & hyperlinks (evaluate every visible run)
     for p_idx, p in enumerate(doc.paragraphs, start=1):
         txt = p.text.strip()
         if not txt:
@@ -261,6 +296,7 @@ def audit_color_contrast(doc: Document) -> list[ColorContrastItem]:
         style_name = p.style.name if p.style else "Normal"
         style_fg = _extract_style_color(doc, style_name) or "#000000"
         style_sz = _extract_style_size_pt(doc, style_name, 11.0)
+        style_bold = _extract_style_bold(doc, style_name)
 
         ppr = p._element.find(f"{{{W_NS}}}pPr")
         p_bg = "#FFFFFF"
@@ -281,17 +317,23 @@ def audit_color_contrast(doc: Document) -> list[ColorContrastItem]:
             fg = style_fg
             if r.font.color and r.font.color.rgb:
                 fg = f"#{r.font.color.rgb}"
+            r_bg = _extract_run_bg(r._element, p_bg)
             sz = round(r.font.size.pt, 1) if r.font.size else style_sz
-            bold = bool(r.bold) or style_name.startswith("Heading")
-            _record(role_label, f"Paragraph {p_idx}", r_txt, fg, p_bg, sz, bold)
+            bold = style_bold if r.bold is None else bool(r.bold)
+            _record(role_label, f"Paragraph {p_idx}", r_txt, fg, r_bg, sz, bold)
 
-        # Hyperlinks in paragraph
+        # Hyperlinks in paragraph (evaluate every run inside each hyperlink)
         for hl in p._element.findall(f"{{{W_NS}}}hyperlink"):
-            hl_txt = "".join(t.text for t in hl.iter(f"{{{W_NS}}}t") if t.text).strip()
-            if not hl_txt:
-                continue
-            hl_fg = "#004F93"
-            for r_el in hl.findall(f"{{{W_NS}}}r"):
+            hl_runs = hl.findall(f"{{{W_NS}}}r")
+            for r_el in hl_runs:
+                r_txt = "".join(t.text for t in r_el.iter(f"{{{W_NS}}}t") if t.text).strip()
+                if not r_txt:
+                    continue
+                has_runs = True
+                hl_fg = "#004F93"
+                hl_bg = _extract_run_bg(r_el, p_bg)
+                hl_sz = style_sz
+                hl_bold = style_bold
                 rpr = r_el.find(f"{{{W_NS}}}rPr")
                 if rpr is not None:
                     c_el = rpr.find(f"{{{W_NS}}}color")
@@ -299,8 +341,16 @@ def audit_color_contrast(doc: Document) -> list[ColorContrastItem]:
                         val = c_el.get(f"{{{W_NS}}}val", "")
                         if val and val.lower() != "auto":
                             hl_fg = normalize_hex(val, "#004F93")
-                            break
-            _record("Hyperlink", f"Paragraph {p_idx}", hl_txt, hl_fg, p_bg, style_sz, False)
+                    sz_el = rpr.find(f"{{{W_NS}}}sz")
+                    if sz_el is not None:
+                        sz_val = sz_el.get(f"{{{W_NS}}}val", "")
+                        if sz_val.isdigit():
+                            hl_sz = round(int(sz_val) / 2.0, 1)
+                    b_el = rpr.find(f"{{{W_NS}}}b")
+                    if b_el is not None:
+                        b_val = b_el.get(f"{{{W_NS}}}val", "true").lower()
+                        hl_bold = b_val not in ("0", "false", "off")
+                _record("Hyperlink", f"Paragraph {p_idx}", r_txt, hl_fg, hl_bg, hl_sz, hl_bold)
 
         if not has_runs:
             _record(
@@ -310,10 +360,10 @@ def audit_color_contrast(doc: Document) -> list[ColorContrastItem]:
                 style_fg,
                 p_bg,
                 style_sz,
-                style_name.startswith("Heading"),
+                style_bold,
             )
 
-    # 2. Tables
+    # 2. Tables (evaluate every visible run in every paragraph of every cell)
     for t_idx, tbl in enumerate(doc.tables, start=1):
         for r_idx, row in enumerate(tbl.rows):
             for c_idx, cell in enumerate(row.cells):
@@ -324,47 +374,55 @@ def audit_color_contrast(doc: Document) -> list[ColorContrastItem]:
                 shd_el = tcPr.find(f"{{{W_NS}}}shd") if tcPr is not None else None
                 fill_val = shd_el.get(f"{{{W_NS}}}fill", "") if shd_el is not None else ""
                 if fill_val and fill_val.lower() != "auto":
-                    bg = normalize_hex(fill_val, "#FFFFFF")
+                    cell_bg = normalize_hex(fill_val, "#FFFFFF")
                 elif r_idx == 0:
-                    bg = "#3E5872"
+                    cell_bg = "#3E5872"
                 else:
-                    bg = "#FFFFFF"
-
-                default_fg = "#FFFFFF" if bg == "#3E5872" else "#000000"
-                fg = default_fg
-                sz = 11.0
-                bold = r_idx == 0
-                for p in cell.paragraphs:
-                    for r in p.runs:
-                        if not (r.text or "").strip():
-                            continue
-                        if r.font.color and r.font.color.rgb:
-                            fg = f"#{r.font.color.rgb}"
-                        if r.font.size:
-                            sz = round(r.font.size.pt, 1)
-                        if r.bold:
-                            bold = True
-                        break
-                    break
+                    cell_bg = "#FFFFFF"
 
                 if r_idx == 0:
                     role = "Table Header Row"
-                elif bg in ("#A3B8CD", "#CFDAE5"):
-                    role = f"Table Category Row ({bg})"
-                elif bg != "#FFFFFF":
-                    role = f"Table Shaded Row ({bg})"
+                elif cell_bg in ("#A3B8CD", "#CFDAE5"):
+                    role = f"Table Category Row ({cell_bg})"
+                elif cell_bg != "#FFFFFF":
+                    role = f"Table Shaded Row ({cell_bg})"
                 else:
                     role = "Table Data Cell"
 
-                _record(
-                    role,
-                    f"Table {t_idx}, Row {r_idx + 1}, Col {c_idx + 1}",
-                    c_txt,
-                    fg,
-                    bg,
-                    sz,
-                    bold,
-                )
+                default_fg = "#FFFFFF" if cell_bg == "#3E5872" else "#000000"
+                loc = f"Table {t_idx}, Row {r_idx + 1}, Col {c_idx + 1}"
+                recorded_any_run = False
+
+                for p in cell.paragraphs:
+                    p_style_name = p.style.name if p.style else "Normal"
+                    p_style_fg = _extract_style_color(doc, p_style_name) or default_fg
+                    p_style_sz = _extract_style_size_pt(doc, p_style_name, 11.0)
+                    p_style_bold = _extract_style_bold(doc, p_style_name) or (r_idx == 0)
+
+                    p_bg = cell_bg
+                    ppr = p._element.find(f"{{{W_NS}}}pPr")
+                    if ppr is not None:
+                        p_shd = ppr.find(f"{{{W_NS}}}shd")
+                        if p_shd is not None:
+                            p_fill = p_shd.get(f"{{{W_NS}}}fill", "")
+                            if p_fill and p_fill.lower() != "auto":
+                                p_bg = normalize_hex(p_fill, cell_bg)
+
+                    for r in p.runs:
+                        r_txt = (r.text or "").strip()
+                        if not r_txt:
+                            continue
+                        recorded_any_run = True
+                        fg = p_style_fg
+                        if r.font.color and r.font.color.rgb:
+                            fg = f"#{r.font.color.rgb}"
+                        r_bg = _extract_run_bg(r._element, p_bg)
+                        sz = round(r.font.size.pt, 1) if r.font.size else p_style_sz
+                        bold = p_style_bold if r.bold is None else bool(r.bold)
+                        _record(role, loc, r_txt, fg, r_bg, sz, bold)
+
+                if not recorded_any_run:
+                    _record(role, loc, c_txt, default_fg, cell_bg, 11.0, r_idx == 0)
 
     return list(grouped.values())
 
@@ -1076,9 +1134,12 @@ def apply_interactive_remediation(
                     pPr.remove(numPr)
 
         if plan.enforce_min_font_size:
+            p_style_name = p.style.name if p.style else "Normal"
+            style_sz_pt = _extract_style_size_pt(doc, p_style_name, 11.0)
             for r in p.runs:
                 if (r.text or "").strip() and not r.font.superscript:
-                    if r.font.size is None or r.font.size.pt < plan.min_font_size_pt:
+                    eff_sz = r.font.size.pt if r.font.size is not None else style_sz_pt
+                    if eff_sz < plan.min_font_size_pt:
                         r.font.size = Pt(plan.min_font_size_pt)
                         r.font.name = "Segoe UI"
                         stats["small_fonts_raised"] += 1
@@ -1096,7 +1157,7 @@ def apply_interactive_remediation(
             parent.remove(p._element)
             stats["spacers_removed"] += 1
 
-    # 7. Apply any user-specified color overrides
+    # 7. Apply any user-specified color overrides across body paragraphs and table cells
     if plan.color_fg_overrides:
         for pair_id, new_hex in plan.color_fg_overrides.items():
             norm_new = normalize_hex(new_hex)
@@ -1107,12 +1168,20 @@ def apply_interactive_remediation(
             )
             parts = pair_id.split("_")
             if len(parts) >= 3:
-                old_fg = f"#{parts[-2]}"
+                old_fg = f"#{parts[-2]}".upper()
                 for p in doc.paragraphs:
                     for r in p.runs:
                         if r.font.color and r.font.color.rgb and f"#{r.font.color.rgb}".upper() == old_fg:
                             r.font.color.rgb = rgb_obj
                             stats["colors_updated"] += 1
+                for tbl in doc.tables:
+                    for row in tbl.rows:
+                        for cell in row.cells:
+                            for p in cell.paragraphs:
+                                for r in p.runs:
+                                    if r.font.color and r.font.color.rgb and f"#{r.font.color.rgb}".upper() == old_fg:
+                                        r.font.color.rgb = rgb_obj
+                                        stats["colors_updated"] += 1
 
     doc.save(output_docx_path)
     return stats
@@ -1360,14 +1429,37 @@ def _graphic_count(page) -> int:
     return n
 
 
+REQUIRED_PDF_AUDIT_CHECKS: tuple[str, ...] = (
+    "MarkInfo (tagged PDF)",
+    "StructTreeRoot (document structure)",
+    "Document language",
+    "Document title",
+    "DisplayDocTitle in ViewerPreferences",
+    "Table headers (TH cells)",
+    "Figure alt text (no file paths)",
+    "Bookmarks/Outline",
+    "Images render in PDF",
+    "No undefined citations (??)",
+    "Figures compiled (captions have images nearby)",
+    "Orphan/widow lines (layout quality)",
+    "Alt text is substantive (descriptive, not just labels)",
+    "No content overflowing page margins",
+    "Captions and notes stay with figures/tables",
+    "Internal Tagged PDF Structural & Content-Coverage Check",
+)
+
+
 def run_pdf_ua_audit(
     pdf_path: str,
     expected_lang: Optional[str] = None,
 ) -> dict:
-    """Run the mandatory, fail-closed 16-check PDF/UA-1 & layout audit on a PDF file.
+    """Run the mandatory, fail-closed 16-check internal tagged PDF structural & layout audit.
 
-    Never defaults to all_passed=True. Fails closed if the file cannot be opened
-    or if any check fails.
+    Note: This is a deterministic internal structural and content-coverage audit
+    (catalog flags, structure tree, table TH scope, figure alt text, marked-content
+    operators, and page layout). Full ISO 14289-1 (PDF/UA-1) certification requires
+    an external PDF/UA validator (e.g., veraPDF or Acrobat Pro Accessibility Checker)
+    plus manual reading-order verification.
     """
     report: dict = {
         "file": os.path.basename(pdf_path),
@@ -1768,35 +1860,53 @@ def run_pdf_ua_audit(
             }
         )
 
-        # CHECK 16: Independent PDF/UA-1 Structure & Tag Tree Verification
+        # CHECK 16: Internal Tagged PDF Structural & Content-Coverage Check
         # Verifies that:
         #   - StructTreeRoot contains > 0 StructElem nodes
         #   - Every TH cell has /Scope (/Column or /Row)
-        #   - Zero StructElem nodes have an empty /Alt () (Acrobat "Other elements alternate text")
-        #   - Every page has /Tabs /S (reading order follows structure tree)
+        #   - Zero StructElem nodes have an empty /Alt ()
+        #   - Every page has /Tabs /S (tab order follows structure tree)
+        #   - Every page with visible text contains Marked Content sequences (BDC/BMC ... EMC)
         pages_with_tabs_s = sum(
             1
             for page in doc
             if doc.xref_get_key(page.xref, "Tabs")[1] == "/S"
         )
+        unmarked_text_pages: list[int] = []
+        for page_num, page in enumerate(doc, start=1):
+            if page.get_text().strip():
+                try:
+                    raw_stream = page.read_contents()
+                except Exception:
+                    raw_stream = b""
+                has_marked_content = (
+                    (b"BDC" in raw_stream or b"BMC" in raw_stream)
+                    and b"EMC" in raw_stream
+                    and (b"/MCID" in raw_stream or b"/Artifact" in raw_stream)
+                )
+                if not has_marked_content:
+                    unmarked_text_pages.append(page_num)
+
         indep_passed = (
             struct_elem_count > 0
             and th_with_scope == th_count
             and len(empty_alt_struct_elems) == 0
             and pages_with_tabs_s == len(doc)
+            and len(unmarked_text_pages) == 0
         )
         indep_detail = (
             f"{struct_elem_count} StructElems, {th_with_scope}/{th_count} scoped TH, "
-            f"0 empty /Alt, {pages_with_tabs_s}/{len(doc)} pages with /Tabs /S"
+            f"0 empty /Alt, {pages_with_tabs_s}/{len(doc)} pages with /Tabs /S & marked content"
             if indep_passed
             else (
                 f"FAIL: struct_elems={struct_elem_count}, scoped_th={th_with_scope}/{th_count}, "
-                f"empty_alt={empty_alt_struct_elems}, tabs_s={pages_with_tabs_s}/{len(doc)}"
+                f"empty_alt={empty_alt_struct_elems}, tabs_s={pages_with_tabs_s}/{len(doc)}, "
+                f"unmarked_pages={unmarked_text_pages}"
             )
         )
         results.append(
             {
-                "check": "Independent PDF/UA-1 Structure & Tag Tree Verification",
+                "check": "Internal Tagged PDF Structural & Content-Coverage Check",
                 "passed": indep_passed,
                 "detail": indep_detail,
                 "severity": "critical",
@@ -1811,10 +1921,21 @@ def run_pdf_ua_audit(
     warnings = [
         r for r in results if not r["passed"] and r["severity"] != "critical"
     ]
-    all_passed = len(results) >= 16 and all(r["passed"] for r in results)
+    present_names = {r.get("check") for r in results}
+    all_required_present = all(req in present_names for req in REQUIRED_PDF_AUDIT_CHECKS)
+    all_passed = (
+        all_required_present
+        and len(results) == len(REQUIRED_PDF_AUDIT_CHECKS)
+        and all(r["passed"] for r in results)
+    )
 
     return {
         "file": os.path.basename(pdf_path),
+        "audit_scope": "internal_structural_audit",
+        "disclaimer": (
+            "Internal 16-check structural & tag audit; full ISO 14289-1 (PDF/UA-1) "
+            "certification requires an external PDF/UA validator and manual reading-order review."
+        ),
         "all_passed": all_passed,
         "critical_failures": len(critical_fails),
         "warnings": len(warnings),
@@ -1828,7 +1949,7 @@ def evaluate_deliverable_gate(
     verification,
     pdf_qa_report: dict,
 ) -> dict:
-    """Fail-closed deliverable gate: blocks 'Accessible' certification if any check fails."""
+    """Fail-closed deliverable gate: requires all Word checks and all 16 exact PDF check identities to pass."""
     blocking_reasons: list[str] = []
 
     if getattr(post_scan, "total_issues", 1) > 0:
@@ -1844,21 +1965,44 @@ def evaluate_deliverable_gate(
         blocking_reasons.append(
             f"Ground-truth transcript verifier did not pass cleanly ({verification.summary()})."
         )
+
     checks = pdf_qa_report.get("checks", []) if isinstance(pdf_qa_report, dict) else []
-    if not pdf_qa_report or not pdf_qa_report.get("all_passed", False) or len(checks) < 15:
-        failed_pdf = [c.get("check", "Unknown") for c in checks if not c.get("passed")]
-        reason = (
-            f"PDF/UA-1 audit failed ({', '.join(failed_pdf)})"
-            if failed_pdf
-            else "PDF/UA-1 audit did not complete all required checks."
+    check_map: dict[str, bool] = {}
+    for c in checks:
+        if isinstance(c, dict) and isinstance(c.get("check"), str):
+            check_map[c["check"]] = bool(c.get("passed") is True)
+
+    missing_checks = [
+        req for req in REQUIRED_PDF_AUDIT_CHECKS if req not in check_map
+    ]
+    failed_checks = [
+        req for req in REQUIRED_PDF_AUDIT_CHECKS if req in check_map and not check_map[req]
+    ]
+    extra_failed = [
+        name for name, ok in check_map.items() if name not in REQUIRED_PDF_AUDIT_CHECKS and not ok
+    ]
+
+    if missing_checks:
+        blocking_reasons.append(
+            f"Internal PDF structural audit is incomplete (missing {len(missing_checks)} required check(s): "
+            f"{', '.join(missing_checks)})."
         )
-        blocking_reasons.append(reason)
+    if failed_checks or extra_failed:
+        all_failed = failed_checks + extra_failed
+        blocking_reasons.append(
+            f"Internal PDF structural audit failed ({', '.join(all_failed)})."
+        )
+    if not missing_checks and not failed_checks and not extra_failed:
+        if not isinstance(pdf_qa_report, dict) or pdf_qa_report.get("all_passed") is not True:
+            blocking_reasons.append(
+                "Internal PDF structural audit report marked all_passed=False."
+            )
 
     passed = len(blocking_reasons) == 0
     return {
         "passed": passed,
         "status_label": (
-            "ACCESSIBLE (Verified Word + PDF/UA-1)"
+            "PASSED INTERNAL ACCESSIBILITY & TAGGED PDF STRUCTURAL AUDIT"
             if passed
             else "BLOCKED — UNRESOLVED ACCESSIBILITY ISSUES"
         ),

@@ -329,7 +329,7 @@ def main():
             sr_transcript = generate_transcript(out_docx_path)
             verification = verify_transcript(out_docx_path)
 
-        with st.spinner("Compiling tagged PDF/UA-1 and running 16-check PDF accessibility audit..."):
+        with st.spinner("Compiling tagged PDF and running 16-check internal PDF structural audit..."):
             pdf_qa_report = build_tagged_pdf_from_docx(
                 out_docx_path,
                 out_pdf_path,
@@ -348,8 +348,10 @@ def main():
             st.success(
                 f"{gate['status_label']} — Word issues: {post_scan.total_issues} | "
                 f"Screen-reader verifier: {verification.summary()} | "
-                f"PDF 16-check audit: ALL PASSED"
+                f"Internal PDF 16-check structural audit: ALL PASSED"
             )
+            if pdf_qa_report.get("disclaimer"):
+                st.caption(pdf_qa_report["disclaimer"])
         else:
             st.error(
                 f"{gate['status_label']}\n\n"
@@ -365,7 +367,7 @@ def main():
                 st.markdown(f"**{verification.summary()}**")
                 st.text(sr_transcript.text_only[:4000])
         with v_col2:
-            with st.expander("Tagged PDF/UA-1 16-Check QA Report", expanded=not gate["passed"]):
+            with st.expander("Internal Tagged PDF 16-Check Structural Audit Report", expanded=not gate["passed"]):
                 for chk in pdf_qa_report.get("checks", []):
                     icon = "PASS" if chk.get("passed") else "FAIL"
                     chk_name = chk.get("check") or chk.get("name") or "Check"
