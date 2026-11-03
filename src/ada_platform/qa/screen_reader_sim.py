@@ -31,6 +31,7 @@ R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
 A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+ADEC_NS = "http://schemas.microsoft.com/office/drawing/2017/decorative"
 
 
 def _qn(ns: str, tag: str) -> str:
@@ -288,11 +289,18 @@ def _process_image(
     """Process a drawing/image element."""
     location = f"Image {image_index}"
 
-    # Get alt text from docPr
+    # Get alt text and decorative flag from docPr
     alt_text = ""
+    is_decorative = False
     for dp in drawing_el.findall(f".//{{{WP_NS}}}docPr"):
         alt_text = dp.get("descr", "").strip()
+        for dec_el in dp.iter(f"{{{ADEC_NS}}}decorative"):
+            if dec_el.get("val") in ("1", "true"):
+                is_decorative = True
         break
+
+    if is_decorative:
+        return  # Screen readers skip images marked decorative in OOXML
 
     if alt_text:
         # Check if alt text is a file path (bad)

@@ -870,9 +870,10 @@ def apply_interactive_remediation(
                 dec = etree.SubElement(ext, f"{{{ADEC_NS}}}decorative")
                 dec.set("val", "1")
 
-    # 2. Apply image decisions (decorative vs. descriptive alt text)
+    # 2. Apply image decisions (decorative vs. descriptive alt text) IN PLACE
+    # Decorative images remain at their original paragraph/page position in <w:body>
+    # with <adec:decorative val="1"/> and unique wp:docPr IDs preserved.
     img_counter = 0
-    drawings_to_move_to_header: list[tuple[object, etree._Element]] = []
     for p in doc.paragraphs:
         for drawing in p._element.findall(f".//{{{W_NS}}}drawing"):
             img_counter += 1
@@ -906,54 +907,33 @@ def apply_interactive_remediation(
                         if list(ext.iter(f"{{{ADEC_NS}}}decorative")):
                             ext.getparent().remove(ext)
 
-            if is_dec:
-                drawings_to_move_to_header.append((p, drawing))
             stats["images_updated"] += 1
 
-    # Move decorative body drawings into First Page Header (w:hdr) so screen readers skip them
-    if drawings_to_move_to_header:
-        section.different_first_page_header_footer = True
-        fp_hdr = section.first_page_header
-        fp_ftr = section.first_page_footer
-        fp_hdr.is_linked_to_previous = False
-        fp_ftr.is_linked_to_previous = False
-
-        for child in list(fp_hdr._element):
-            fp_hdr._element.remove(child)
-        for child in list(section.header._element):
-            fp_hdr._element.append(copy.deepcopy(child))
-
-        for child in list(fp_ftr._element):
-            fp_ftr._element.remove(child)
-        for child in list(section.footer._element):
-            fp_ftr._element.append(copy.deepcopy(child))
-
-        hdr_p = fp_hdr.paragraphs[0] if fp_hdr.paragraphs else fp_hdr.add_paragraph()
-        for p_owner, drawing_el in drawings_to_move_to_header:
-            drawing_copy = copy.deepcopy(drawing_el)
-            for dp in drawing_copy.iter(f"{{{WP_NS}}}docPr"):
-                dp.set("id", "991")
-                dp.set("descr", "")
-
-            for blip in drawing_copy.iter(f"{{{A_NS}}}blip"):
-                old_rid = blip.get(f"{{{R_NS}}}embed")
-                if old_rid and old_rid in doc.part.rels:
-                    img_part = doc.part.rels[old_rid].target_part
-                    new_rid = fp_hdr.part.relate_to(
-                        img_part,
-                        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image",
-                    )
-                    blip.set(f"{{{R_NS}}}embed", new_rid)
-
-            new_r = OxmlElement("w:r")
-            new_r.append(drawing_copy)
-            hdr_p._element.append(new_r)
-
-            parent_r = drawing_el.getparent()
-            if parent_r is not None and etree.QName(parent_r).localname == "r":
-                parent_r.getparent().remove(parent_r)
-            elif drawing_el.getparent() is not None:
-                drawing_el.getparent().remove(drawing_el)
+    # Ensure strictly unique positive integer wp:docPr[@id] across body and headers/footers
+    used_docpr_ids: set[int] = set()
+    all_roots = [doc.element]
+    for hdr_ftr in (
+        section.header,
+        section.footer,
+        section.first_page_header,
+        section.first_page_footer,
+    ):
+        if hdr_ftr is not None and hdr_ftr._element is not None:
+            all_roots.append(hdr_ftr._element)
+    next_id = 1
+    for root_el in all_roots:
+        for dp in root_el.iter(f"{{{WP_NS}}}docPr"):
+            raw_id = dp.get("id", "")
+            try:
+                val_id = int(raw_id)
+            except ValueError:
+                val_id = -1
+            if val_id <= 0 or val_id in used_docpr_ids:
+                while next_id in used_docpr_ids:
+                    next_id += 1
+                val_id = next_id
+                dp.set("id", str(val_id))
+            used_docpr_ids.add(val_id)
 
     # 3. Apply paragraph style overrides
     for p_idx, p in enumerate(doc.paragraphs, start=1):
@@ -1204,6 +1184,32 @@ def _format_cell_latex(cell) -> str:
     return "".join(out).strip()
 
 
+def _extract_document_language(doc: Document, default: str = "en-US") -> str:
+    """Read the BCP-47 language tag from a DOCX's settings or styles."""
+    if doc.settings and doc.settings.element is not None:
+        for tag in ("themeFontLang", "lang"):
+            for el in doc.settings.element.findall(f".//{{{W_NS}}}{tag}"):
+                val = el.get(f"{{{W_NS}}}val") or el.get("val", "")
+                if val and val.strip():
+                    return val.strip()
+    if doc.styles and doc.styles.element is not None:
+        for el in doc.styles.element.findall(f".//{{{W_NS}}}lang"):
+            for attr in (f"{{{W_NS}}}val", "val", f"{{{W_NS}}}bidi", f"{{{W_NS}}}eastAsia"):
+                val = el.get(attr, "")
+                if val and val.strip():
+                    return val.strip()
+    return default
+
+
+def _is_drawing_decorative(drawing_el: etree._Element) -> bool:
+    """Return True if drawing_el has <adec:decorative val="1"/>."""
+    for dp in drawing_el.findall(f".//{{{WP_NS}}}docPr"):
+        for dec_el in dp.iter(f"{{{ADEC_NS}}}decorative"):
+            if dec_el.get("val") in ("1", "true"):
+                return True
+    return False
+
+
 def _extract_header_footer_images(doc: Document, tex_dir: Path) -> dict[str, str]:
     """Extract decorative header/footer images from the DOCX into tex_dir."""
     extracted: dict[str, str] = {}
@@ -1219,7 +1225,7 @@ def _extract_header_footer_images(doc: Document, tex_dir: Path) -> dict[str, str
             extracted["header_small"] = fname
             break
 
-    # 2. First page header extra motif (if different_first_page_header_footer)
+    # 2. First page header extra motif (if in first_page_header or floating decorative in Para 1)
     if section.different_first_page_header_footer:
         blips = list(section.first_page_header._element.iter(f"{{{A_NS}}}blip"))
         if len(blips) >= 2:
@@ -1229,6 +1235,22 @@ def _extract_header_footer_images(doc: Document, tex_dir: Path) -> dict[str, str
                 fname = "motif_page1.png"
                 (tex_dir / fname).write_bytes(blob)
                 extracted["page1_motif"] = fname
+
+    if "page1_motif" not in extracted and doc.paragraphs:
+        first_p = doc.paragraphs[0]
+        for drawing in first_p._element.findall(f".//{{{W_NS}}}drawing"):
+            is_floating = drawing.find(f"{{{WP_NS}}}anchor") is not None
+            if is_floating and _is_drawing_decorative(drawing):
+                for blip in drawing.findall(f".//{{{A_NS}}}blip"):
+                    rid = blip.get(f"{{{R_NS}}}embed")
+                    if rid and rid in doc.part.rels:
+                        blob = doc.part.rels[rid].target_part.blob
+                        fname = "motif_page1.png"
+                        (tex_dir / fname).write_bytes(blob)
+                        extracted["page1_motif"] = fname
+                        break
+                if "page1_motif" in extracted:
+                    break
 
     # 3. Footer logo
     for idx, blip in enumerate(section.footer._element.iter(f"{{{A_NS}}}blip"), start=1):
@@ -1243,12 +1265,614 @@ def _extract_header_footer_images(doc: Document, tex_dir: Path) -> dict[str, str
     return extracted
 
 
+def postprocess_tagged_pdf(
+    compiled_pdf_path: str,
+    output_pdf_path: str,
+    title_str: str,
+    author_str: str,
+    doc_lang: str,
+) -> None:
+    """Built-in mandatory PDF/UA-1 post-processor (promotes TH cells, cleans filepath Alt, sets catalog keys)."""
+    pdf_doc = fitz.open(compiled_pdf_path)
+    cat = pdf_doc.pdf_catalog()
+    pdf_doc.xref_set_key(cat, "ViewerPreferences", "<< /DisplayDocTitle true >>")
+    pdf_doc.xref_set_key(cat, "MarkInfo", "<< /Marked true >>")
+    pdf_doc.xref_set_key(cat, "Lang", f"({doc_lang})")
+    for page in pdf_doc:
+        pdf_doc.xref_set_key(page.xref, "Tabs", "/S")
+
+    def _extract_k_xrefs(doc_obj, xref_id: int) -> list[int]:
+        k_val = doc_obj.xref_get_key(xref_id, "K")
+        if k_val[0] == "null":
+            return []
+        return [int(m) for m in re.findall(r"(\d+)\s+0\s+R", k_val[1])]
+
+    filepath_pattern = re.compile(
+        r"(figures/|assets/|dividers/|/tmp/|\.png|\.pdf|\.jpg)", re.IGNORECASE
+    )
+
+    for xref in range(1, pdf_doc.xref_length()):
+        try:
+            obj = pdf_doc.xref_object(xref)
+        except Exception:
+            continue
+        if "/Type /StructElem" not in obj:
+            continue
+
+        # 1. Promote first-row table cells to <TH /Scope /Column>
+        if re.search(r"/S\s+/Table\b", obj):
+            children = _extract_k_xrefs(pdf_doc, xref)
+            first_tr = None
+            for ch in children:
+                ch_obj = pdf_doc.xref_object(ch)
+                if re.search(r"/S\s+/TR\b", ch_obj):
+                    first_tr = ch
+                    break
+                if re.search(r"/S\s+/THead\b", ch_obj):
+                    for sub in _extract_k_xrefs(pdf_doc, ch):
+                        if re.search(r"/S\s+/TR\b", pdf_doc.xref_object(sub)):
+                            first_tr = sub
+                            break
+                    if first_tr:
+                        break
+            if first_tr:
+                for cell_xref in _extract_k_xrefs(pdf_doc, first_tr):
+                    cell_obj = pdf_doc.xref_object(cell_xref)
+                    if re.search(r"/S\s+/(TD|TH)\b", cell_obj):
+                        pdf_doc.xref_set_key(cell_xref, "S", "/TH")
+                        pdf_doc.xref_set_key(
+                            cell_xref, "A", "<< /O /Table /Scope /Column >>"
+                        )
+
+        # 2. Convert any accidental filepath /Alt on /Figure to /Artifact without /Alt
+        if re.search(r"/S\s+/Figure\b", obj):
+            alt_text = None
+            alt_match = re.search(r"/Alt\s*\(([^)]*)\)", obj)
+            if alt_match:
+                alt_text = alt_match.group(1)
+            else:
+                ak = pdf_doc.xref_get_key(xref, "Alt")
+                if ak[0] != "null":
+                    alt_text = ak[1]
+            if alt_text and filepath_pattern.search(alt_text):
+                pdf_doc.xref_set_key(xref, "S", "/Artifact")
+                pdf_doc.xref_set_key(xref, "Alt", "null")
+
+    pdf_doc.set_metadata(
+        {
+            "title": title_str,
+            "author": author_str,
+            "subject": title_str,
+            "creator": "Santa Clara County Public Health Department",
+        }
+    )
+    pdf_doc.save(output_pdf_path, garbage=3, deflate=True)
+    pdf_doc.close()
+
+
+def _graphic_count(page) -> int:
+    """Count raster + vector XObject graphics on a PDF page."""
+    n = len(page.get_images())
+    try:
+        n += len(page.get_xobjects())
+    except Exception:
+        pass
+    return n
+
+
+def run_pdf_ua_audit(
+    pdf_path: str,
+    expected_lang: Optional[str] = None,
+) -> dict:
+    """Run the mandatory, fail-closed 16-check PDF/UA-1 & layout audit on a PDF file.
+
+    Never defaults to all_passed=True. Fails closed if the file cannot be opened
+    or if any check fails.
+    """
+    report: dict = {
+        "file": os.path.basename(pdf_path),
+        "all_passed": False,
+        "critical_failures": 1,
+        "warnings": 0,
+        "checks": [],
+    }
+    if not os.path.exists(pdf_path):
+        report["checks"] = [
+            {
+                "check": "PDF file exists",
+                "passed": False,
+                "detail": f"MISSING: {pdf_path}",
+                "severity": "critical",
+            }
+        ]
+        return report
+
+    doc = fitz.open(pdf_path)
+    results: list[dict] = []
+    try:
+        catalog = doc.pdf_catalog()
+
+        # CHECK 1: MarkInfo (tagged PDF)
+        mi = doc.xref_get_key(catalog, "MarkInfo")
+        mi_passed = mi[0] != "null" and "/Marked true" in mi[1]
+        results.append(
+            {
+                "check": "MarkInfo (tagged PDF)",
+                "passed": mi_passed,
+                "detail": f"Value: {mi}" if mi_passed else "MISSING: PDF is not tagged",
+                "severity": "critical",
+            }
+        )
+
+        # CHECK 2: StructTreeRoot
+        st_root = doc.xref_get_key(catalog, "StructTreeRoot")
+        st_passed = st_root[0] != "null"
+        results.append(
+            {
+                "check": "StructTreeRoot (document structure)",
+                "passed": st_passed,
+                "detail": "Present" if st_passed else "MISSING: No structure tree",
+                "severity": "critical",
+            }
+        )
+
+        # CHECK 3: Document language (and match against expected_lang if provided)
+        lang = doc.xref_get_key(catalog, "Lang")
+        lang_val_clean = lang[1].strip("()") if lang[0] != "null" else ""
+        lang_passed = bool(lang_val_clean) and (
+            expected_lang is None or lang_val_clean == expected_lang
+        )
+        lang_detail = (
+            f"Lang: {lang[1]}"
+            if lang_passed
+            else (
+                f"MISMATCH: found '{lang_val_clean}', expected '{expected_lang}'"
+                if lang_val_clean
+                else "MISSING: No language set"
+            )
+        )
+        results.append(
+            {
+                "check": "Document language",
+                "passed": lang_passed,
+                "detail": lang_detail,
+                "severity": "critical",
+            }
+        )
+
+        # CHECK 4: Document title
+        meta = doc.metadata or {}
+        has_title = bool((meta.get("title") or "").strip())
+        results.append(
+            {
+                "check": "Document title",
+                "passed": has_title,
+                "detail": (
+                    f"Title: {meta.get('title', '')}"
+                    if has_title
+                    else "MISSING: No title in metadata"
+                ),
+                "severity": "critical",
+            }
+        )
+
+        # CHECK 5: DisplayDocTitle
+        vp = doc.xref_get_key(catalog, "ViewerPreferences")
+        vp_passed = vp[0] != "null" and "DisplayDocTitle" in vp[1]
+        results.append(
+            {
+                "check": "DisplayDocTitle in ViewerPreferences",
+                "passed": vp_passed,
+                "detail": (
+                    "Present"
+                    if vp_passed
+                    else "MISSING: Title won't display in reader title bar"
+                ),
+                "severity": "warning",
+            }
+        )
+
+        # CHECK 6: Table headers (TH vs TD)
+        th_count = 0
+        th_with_scope = 0
+        td_count = 0
+        table_count = 0
+        struct_elem_count = 0
+        empty_alt_struct_elems: list[int] = []
+
+        for xref in range(1, doc.xref_length()):
+            try:
+                obj = doc.xref_object(xref)
+            except Exception:
+                continue
+            if "/Type /StructElem" in obj:
+                struct_elem_count += 1
+                if re.search(r"/Alt\s*\(\s*\)", obj):
+                    empty_alt_struct_elems.append(xref)
+                if re.search(r"/S\s+/TH\b", obj):
+                    th_count += 1
+                    if "/Scope /Column" in obj or "/Scope /Row" in obj:
+                        th_with_scope += 1
+                elif re.search(r"/S\s+/TD\b", obj):
+                    td_count += 1
+                elif re.search(r"/S\s+/Table\b", obj):
+                    table_count += 1
+
+        if table_count == 0:
+            th_passed = True
+            th_detail = "No tables in document (skip)"
+        elif th_count > 0:
+            th_passed = True
+            th_detail = f"{th_count} TH, {td_count} TD across {table_count} tables"
+        else:
+            th_passed = False
+            th_detail = f"FAIL: {td_count} TD cells, ZERO TH cells across {table_count} tables"
+
+        results.append(
+            {
+                "check": "Table headers (TH cells)",
+                "passed": th_passed,
+                "detail": th_detail,
+                "severity": "critical",
+            }
+        )
+
+        # CHECK 7: Figure alt text -- NO FILE PATHS
+        fig_count = 0
+        filepath_alt: list[str] = []
+        missing_alt: list[str] = []
+        good_alt = 0
+
+        for xref in range(1, doc.xref_length()):
+            try:
+                obj = doc.xref_object(xref)
+            except Exception:
+                continue
+            if "/Type /StructElem" in obj and re.search(r"/S\s+/Figure\b", obj):
+                fig_count += 1
+                alt_match = re.search(r"/Alt\s*\(([^)]*)\)", obj)
+                alt_val = ""
+                if alt_match:
+                    alt_val = alt_match.group(1)
+                else:
+                    ak = doc.xref_get_key(xref, "Alt")
+                    if ak[0] != "null":
+                        alt_val = ak[1].strip("()")
+                if not alt_val or len(alt_val.strip()) < 5:
+                    missing_alt.append(f"xref {xref}")
+                elif re.search(
+                    r"(figures/|assets/|\.png|\.pdf|\.jpg|/tmp/)",
+                    alt_val,
+                    re.IGNORECASE,
+                ):
+                    filepath_alt.append(alt_val[:80])
+                else:
+                    good_alt += 1
+
+        alt_passed = len(filepath_alt) == 0 and len(missing_alt) == 0
+        if fig_count == 0:
+            alt_detail = "No Figure elements in structure tree"
+        elif alt_passed:
+            alt_detail = f"{good_alt}/{fig_count} figures have descriptive alt text"
+        else:
+            alt_detail = f"FAIL: filepath_alt={filepath_alt}, missing_alt={missing_alt}"
+
+        results.append(
+            {
+                "check": "Figure alt text (no file paths)",
+                "passed": alt_passed,
+                "detail": alt_detail,
+                "severity": "critical",
+            }
+        )
+
+        # CHECK 8: Bookmarks/Outline
+        toc = doc.get_toc()
+        results.append(
+            {
+                "check": "Bookmarks/Outline",
+                "passed": len(toc) > 0,
+                "detail": (
+                    f"{len(toc)} bookmarks"
+                    if toc
+                    else "MISSING: No bookmarks for navigation"
+                ),
+                "severity": "warning",
+            }
+        )
+
+        # CHECK 9: Images actually render
+        total_images = sum(_graphic_count(page) for page in doc)
+        results.append(
+            {
+                "check": "Images render in PDF",
+                "passed": total_images > 0 or fig_count == 0,
+                "detail": f"{total_images} graphics (raster+vector) across {len(doc)} pages",
+                "severity": "critical" if fig_count > 0 and total_images == 0 else "info",
+            }
+        )
+
+        # CHECK 10: No undefined citations (??)
+        question_marks = sum(len(re.findall(r"\?\?", page.get_text())) for page in doc)
+        results.append(
+            {
+                "check": "No undefined citations (??)",
+                "passed": question_marks == 0,
+                "detail": (
+                    "Clean"
+                    if question_marks == 0
+                    else f"FAIL: {question_marks} '??' found"
+                ),
+                "severity": "critical" if question_marks > 2 else "warning",
+            }
+        )
+
+        # CHECK 11: Figures compiled (caption pages have images nearby)
+        caption_pages_without_images: list[int] = []
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            text = page.get_text()
+            has_figure_caption = bool(re.search(r"Figure\s+\d+[.:]\s", text))
+            has_images = _graphic_count(page) > 0
+            is_source_notes = bool(
+                re.search(r"Source Notes|Figure and Table Source", text)
+            )
+            if has_figure_caption and not has_images and not is_source_notes:
+                next_has = (
+                    _graphic_count(doc[page_num + 1]) > 0
+                    if page_num + 1 < len(doc)
+                    else False
+                )
+                if not next_has:
+                    caption_pages_without_images.append(page_num + 1)
+
+        fig_compiled = len(caption_pages_without_images) == 0
+        results.append(
+            {
+                "check": "Figures compiled (captions have images nearby)",
+                "passed": fig_compiled,
+                "detail": (
+                    "All figure captions have images on same or adjacent page"
+                    if fig_compiled
+                    else f"FAIL: Pages with figure captions but no images: {caption_pages_without_images}"
+                ),
+                "severity": "critical",
+            }
+        )
+
+        # CHECK 12: Orphan/widow lines
+        orphan_pages: list[tuple[int, str]] = []
+        for page_num in range(2, len(doc)):
+            page = doc[page_num]
+            text = page.get_text().strip()
+            images = page.get_images()
+            if len(images) == 1 and len(text) < 200:
+                continue
+            if len(text) < 20:
+                continue
+            lines = [l.strip() for l in text.split("\n") if l.strip()]
+            content_lines = lines[1:-2] if len(lines) > 3 else lines
+            if 0 < len(content_lines) <= 3:
+                if sum(len(l) for l in content_lines) < 150:
+                    orphan_pages.append(
+                        (page_num + 1, content_lines[0][:50] if content_lines else "")
+                    )
+        orphan_passed = len(orphan_pages) <= 2
+        results.append(
+            {
+                "check": "Orphan/widow lines (layout quality)",
+                "passed": orphan_passed,
+                "detail": (
+                    f"Clean ({len(orphan_pages)} short pages)"
+                    if orphan_passed
+                    else f"WARNING: {len(orphan_pages)} pages with orphan text"
+                ),
+                "severity": "warning",
+            }
+        )
+
+        # CHECK 13: Alt text is substantive
+        shallow_alt: list[str] = []
+        for xref in range(1, doc.xref_length()):
+            try:
+                obj = doc.xref_object(xref)
+            except Exception:
+                continue
+            if "/Type /StructElem" not in obj or not re.search(r"/S\s+/Figure\b", obj):
+                continue
+            alt_match = re.search(r"/Alt\s*\(([^)]*)\)", obj)
+            alt_text = alt_match.group(1) if alt_match else None
+            if alt_text is None:
+                ak = doc.xref_get_key(xref, "Alt")
+                if ak[0] != "null":
+                    alt_text = ak[1].strip("()")
+            if alt_text is not None:
+                stripped = alt_text.strip()
+                if len(stripped) < 20:
+                    shallow_alt.append(f"xref {xref}: too short ({len(stripped)} chars)")
+        substantive_passed = len(shallow_alt) == 0
+        results.append(
+            {
+                "check": "Alt text is substantive (descriptive, not just labels)",
+                "passed": substantive_passed,
+                "detail": (
+                    f"All {good_alt} figure alt texts are descriptive"
+                    if substantive_passed
+                    else f"WARNING: {shallow_alt}"
+                ),
+                "severity": "warning",
+            }
+        )
+
+        # CHECK 14: No content overflowing page margins
+        overflow_pages: list[tuple[int, int]] = []
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            rect = page.rect
+            header_zone = 60
+            footer_zone = rect.height - 60
+            body_bottom_limit = rect.height - 62
+            blocks = page.get_text("blocks")
+            body_blocks = [
+                b
+                for b in blocks
+                if b[6] == 0 and b[1] > header_zone and b[3] < footer_zone
+            ]
+            if body_blocks:
+                max_y = max(b[3] for b in body_blocks)
+                overflow = round(max_y - body_bottom_limit)
+                if overflow > 2:
+                    overflow_pages.append((page_num + 1, overflow))
+        overflow_passed = len(overflow_pages) == 0
+        results.append(
+            {
+                "check": "No content overflowing page margins",
+                "passed": overflow_passed,
+                "detail": (
+                    "Clean"
+                    if overflow_passed
+                    else f"WARNING: overflow on pages {overflow_pages}"
+                ),
+                "severity": "warning",
+            }
+        )
+
+        # CHECK 15: Captions and notes stay with figures/tables
+        separated_captions: list[str] = []
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            blocks = page.get_text("blocks")
+            images = page.get_images()
+            for block in blocks:
+                if block[6] != 0:
+                    continue
+                block_text = block[4].strip()
+                if block[3] > page.rect.height - 100:
+                    if (
+                        re.search(r"^(Figure|Figura)\s+\d+[.:]", block_text)
+                        and not images
+                        and getattr(page, "rotation", 0) == 0
+                    ):
+                        separated_captions.append(f"p.{page_num + 1}: {block_text[:40]}")
+        caption_passed = len(separated_captions) == 0
+        results.append(
+            {
+                "check": "Captions and notes stay with figures/tables",
+                "passed": caption_passed,
+                "detail": (
+                    "Clean"
+                    if caption_passed
+                    else f"WARNING: {separated_captions}"
+                ),
+                "severity": "warning",
+            }
+        )
+
+        # CHECK 16: Independent PDF/UA-1 Structure & Tag Tree Verification
+        # Verifies that:
+        #   - StructTreeRoot contains > 0 StructElem nodes
+        #   - Every TH cell has /Scope (/Column or /Row)
+        #   - Zero StructElem nodes have an empty /Alt () (Acrobat "Other elements alternate text")
+        #   - Every page has /Tabs /S (reading order follows structure tree)
+        pages_with_tabs_s = sum(
+            1
+            for page in doc
+            if doc.xref_get_key(page.xref, "Tabs")[1] == "/S"
+        )
+        indep_passed = (
+            struct_elem_count > 0
+            and th_with_scope == th_count
+            and len(empty_alt_struct_elems) == 0
+            and pages_with_tabs_s == len(doc)
+        )
+        indep_detail = (
+            f"{struct_elem_count} StructElems, {th_with_scope}/{th_count} scoped TH, "
+            f"0 empty /Alt, {pages_with_tabs_s}/{len(doc)} pages with /Tabs /S"
+            if indep_passed
+            else (
+                f"FAIL: struct_elems={struct_elem_count}, scoped_th={th_with_scope}/{th_count}, "
+                f"empty_alt={empty_alt_struct_elems}, tabs_s={pages_with_tabs_s}/{len(doc)}"
+            )
+        )
+        results.append(
+            {
+                "check": "Independent PDF/UA-1 Structure & Tag Tree Verification",
+                "passed": indep_passed,
+                "detail": indep_detail,
+                "severity": "critical",
+            }
+        )
+    finally:
+        doc.close()
+
+    critical_fails = [
+        r for r in results if not r["passed"] and r["severity"] == "critical"
+    ]
+    warnings = [
+        r for r in results if not r["passed"] and r["severity"] != "critical"
+    ]
+    all_passed = len(results) >= 16 and all(r["passed"] for r in results)
+
+    return {
+        "file": os.path.basename(pdf_path),
+        "all_passed": all_passed,
+        "critical_failures": len(critical_fails),
+        "warnings": len(warnings),
+        "checks": results,
+    }
+
+
+def evaluate_deliverable_gate(
+    post_scan,
+    sr_transcript,
+    verification,
+    pdf_qa_report: dict,
+) -> dict:
+    """Fail-closed deliverable gate: blocks 'Accessible' certification if any check fails."""
+    blocking_reasons: list[str] = []
+
+    if getattr(post_scan, "total_issues", 1) > 0:
+        blocking_reasons.append(
+            f"Word accessibility scan found {post_scan.total_issues} unresolved issue(s)."
+        )
+    sr_warnings = getattr(sr_transcript, "warnings", [])
+    if len(sr_warnings) > 0:
+        blocking_reasons.append(
+            f"Screen-reader transcript simulator reported {len(sr_warnings)} warning(s)."
+        )
+    if not getattr(verification, "passed", False) or getattr(verification, "gap_count", 1) > 0:
+        blocking_reasons.append(
+            f"Ground-truth transcript verifier did not pass cleanly ({verification.summary()})."
+        )
+    checks = pdf_qa_report.get("checks", []) if isinstance(pdf_qa_report, dict) else []
+    if not pdf_qa_report or not pdf_qa_report.get("all_passed", False) or len(checks) < 15:
+        failed_pdf = [c.get("check", "Unknown") for c in checks if not c.get("passed")]
+        reason = (
+            f"PDF/UA-1 audit failed ({', '.join(failed_pdf)})"
+            if failed_pdf
+            else "PDF/UA-1 audit did not complete all required checks."
+        )
+        blocking_reasons.append(reason)
+
+    passed = len(blocking_reasons) == 0
+    return {
+        "passed": passed,
+        "status_label": (
+            "ACCESSIBLE (Verified Word + PDF/UA-1)"
+            if passed
+            else "BLOCKED — UNRESOLVED ACCESSIBILITY ISSUES"
+        ),
+        "blocking_reasons": blocking_reasons,
+    }
+
+
 def build_tagged_pdf_from_docx(
     remediated_docx_path: str,
     output_pdf_path: str,
     work_dir: Optional[str] = None,
+    language: Optional[str] = None,
 ) -> dict:
-    """Compile a tagged PDF/UA-1 file from a remediated DOCX and run the 15-check QA audit."""
+    """Compile a tagged PDF/UA-1 file from a remediated DOCX and run the mandatory 16-check QA audit."""
     docx_p = Path(remediated_docx_path)
     out_pdf_p = Path(output_pdf_path)
     tex_dir = Path(work_dir) if work_dir else out_pdf_p.parent / "_pdf_build"
@@ -1259,6 +1883,7 @@ def build_tagged_pdf_from_docx(
     author_str = (
         doc.core_properties.author or "Santa Clara County Public Health Department"
     ).strip()
+    doc_lang = (language or _extract_document_language(doc, "en-US")).strip() or "en-US"
 
     hdr_imgs = _extract_header_footer_images(doc, tex_dir)
     hdr_left_tex = rf"\small\color{{phdheader}}\textbf{{{_latex_escape(title_str)}}}"
@@ -1280,7 +1905,7 @@ def build_tagged_pdf_from_docx(
         r"\DocumentMetadata{",
         r"  pdfversion=1.7,",
         r"  pdfstandard=ua-1,",
-        r"  lang=en-US,",
+        rf"  lang={doc_lang},",
         r"  testphase={phase-III,math,table,title,graphic}",
         r"}",
         r"\documentclass[11pt,letterpaper]{article}",
@@ -1348,22 +1973,33 @@ def build_tagged_pdf_from_docx(
             p = doc.paragraphs[p_idx]
             p_idx += 1
 
-            # Check for informative body images in this paragraph
+            # Render body images (informative or in-place decorative)
             for drawing in p._element.findall(f".//{{{W_NS}}}drawing"):
+                is_floating = drawing.find(f"{{{WP_NS}}}anchor") is not None
+                is_dec = _is_drawing_decorative(drawing)
+                # Page 1 floating decorative motif is already rendered in \fancypagestyle{firstpage}
+                if p_idx == 1 and is_floating and is_dec and "page1_motif" in hdr_imgs:
+                    continue
+
                 alt_text = ""
                 for dp in drawing.findall(f".//{{{WP_NS}}}docPr"):
                     alt_text = dp.get("descr", "").strip()
                     break
                 for blip in drawing.findall(f".//{{{A_NS}}}blip"):
                     rid = blip.get(f"{{{R_NS}}}embed")
-                    if rid and rid in doc.part.rels and alt_text:
+                    if rid and rid in doc.part.rels:
                         body_img_idx += 1
                         img_fn = f"body_fig_{body_img_idx}.png"
                         (tex_dir / img_fn).write_bytes(doc.part.rels[rid].target_part.blob)
-                        esc_alt = _latex_escape(alt_text)
-                        tex_lines.append(
-                            rf"\begin{{center}}\includegraphics[max width=0.9\textwidth,alt={{{esc_alt}}}]{{{img_fn}}}\end{{center}}"
-                        )
+                        if is_dec:
+                            tex_lines.append(
+                                rf"\begin{{center}}\includegraphics[width=0.45\textwidth,artifact,alt={{Decorative graphic}}]{{{img_fn}}}\end{{center}}"
+                            )
+                        elif alt_text:
+                            esc_alt = _latex_escape(alt_text)
+                            tex_lines.append(
+                                rf"\begin{{center}}\includegraphics[ width=0.85\textwidth,alt={{{esc_alt}}}]{{{img_fn}}}\end{{center}}"
+                            )
                     break
 
             txt = p.text.strip()
@@ -1468,84 +2104,15 @@ def build_tagged_pdf_from_docx(
 
     compiled_pdf = tex_dir / "document_ada.pdf"
 
-    # Run ada_postprocess.py if available
-    postprocess_script = Path.home() / ".claude" / "scripts" / "ada_postprocess.py"
-    if postprocess_script.exists():
-        subprocess.run(
-            [sys.executable, str(postprocess_script), str(compiled_pdf)],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-
-    # Promote Row-0 table header cells to <TH /Scope /Column> and set PDF/UA catalog flags
-    pdf_doc = fitz.open(str(compiled_pdf))
-    cat = pdf_doc.pdf_catalog()
-    pdf_doc.xref_set_key(cat, "ViewerPreferences", "<< /DisplayDocTitle true >>")
-    pdf_doc.xref_set_key(cat, "MarkInfo", "<< /Marked true >>")
-    pdf_doc.xref_set_key(cat, "Lang", "(en-US)")
-    for page in pdf_doc:
-        pdf_doc.xref_set_key(page.xref, "Tabs", "/S")
-
-    def _extract_k_xrefs(doc_obj, xref_id: int) -> list[int]:
-        k_val = doc_obj.xref_get_key(xref_id, "K")
-        if k_val[0] == "null":
-            return []
-        return [int(m) for m in re.findall(r"(\d+)\s+0\s+R", k_val[1])]
-
-    for xref in range(1, pdf_doc.xref_length()):
-        try:
-            obj = pdf_doc.xref_object(xref)
-        except Exception:
-            continue
-        if "/Type /StructElem" in obj and re.search(r"/S\s+/Table\b", obj):
-            children = _extract_k_xrefs(pdf_doc, xref)
-            first_tr = None
-            for ch in children:
-                ch_obj = pdf_doc.xref_object(ch)
-                if re.search(r"/S\s+/TR\b", ch_obj):
-                    first_tr = ch
-                    break
-                if re.search(r"/S\s+/THead\b", ch_obj):
-                    for sub in _extract_k_xrefs(pdf_doc, ch):
-                        if re.search(r"/S\s+/TR\b", pdf_doc.xref_object(sub)):
-                            first_tr = sub
-                            break
-                    if first_tr:
-                        break
-            if first_tr:
-                for cell_xref in _extract_k_xrefs(pdf_doc, first_tr):
-                    cell_obj = pdf_doc.xref_object(cell_xref)
-                    if re.search(r"/S\s+/(TD|TH)\b", cell_obj):
-                        pdf_doc.xref_set_key(cell_xref, "S", "/TH")
-                        pdf_doc.xref_set_key(
-                            cell_xref, "A", "<< /O /Table /Scope /Column >>"
-                        )
-
-    pdf_doc.set_metadata(
-        {
-            "title": title_str,
-            "author": author_str,
-            "subject": title_str,
-            "creator": "Santa Clara County Public Health Department",
-        }
+    # Run mandatory built-in PDF/UA-1 post-processor
+    postprocess_tagged_pdf(
+        str(compiled_pdf),
+        str(out_pdf_p),
+        title_str=title_str,
+        author_str=author_str,
+        doc_lang=doc_lang,
     )
-    pdf_doc.save(str(out_pdf_p), garbage=3, deflate=True)
-    pdf_doc.close()
 
-    # Run 15-check ada_qa_audit.py if available
-    qa_script = Path.home() / ".claude" / "scripts" / "ada_qa_audit.py"
-    qa_report = {"all_passed": True, "critical_failures": 0, "warnings": 0, "checks": []}
-    if qa_script.exists():
-        subprocess.run(
-            [sys.executable, str(qa_script), str(out_pdf_p)],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        qa_json = Path(str(out_pdf_p).rsplit(".", 1)[0] + "_qa_report.json")
-        if qa_json.exists():
-            qa_report = json.loads(qa_json.read_text())
-            qa_json.unlink(missing_ok=True)
-
+    # Run mandatory fail-closed 16-check PDF/UA-1 QA audit
+    qa_report = run_pdf_ua_audit(str(out_pdf_p), expected_lang=doc_lang)
     return qa_report

@@ -27,6 +27,7 @@ from ada_platform.qa.screen_reader_sim import (
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+ADEC_NS = "http://schemas.microsoft.com/office/drawing/2017/decorative"
 
 
 @dataclass
@@ -165,9 +166,15 @@ def extract_ground_truth(file_path: str) -> list[GroundTruthElement]:
             for drawing in child.findall(f".//{{{W_NS}}}drawing"):
                 image_idx += 1
                 alt_text = ""
+                is_decorative = False
                 for dp in drawing.findall(f".//{{{WP_NS}}}docPr"):
                     alt_text = dp.get("descr", "").strip()
+                    for dec_el in dp.iter(f"{{{ADEC_NS}}}decorative"):
+                        if dec_el.get("val") in ("1", "true"):
+                            is_decorative = True
                     break
+                if is_decorative:
+                    continue
                 elements.append(GroundTruthElement(
                     kind="image",
                     text=alt_text,

@@ -30,6 +30,7 @@ _NSMAP = {
     "pic": "http://schemas.openxmlformats.org/drawingml/2006/picture",
     "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
     "wps": "http://schemas.microsoft.com/office/word/2010/wordprocessingShape",
+    "adec": "http://schemas.microsoft.com/office/drawing/2017/decorative",
 }
 
 # URL-like pattern for detecting bare URLs used as link text
@@ -233,16 +234,23 @@ class DocxScanner(BaseScanner):
             image_count += 1
             position = image_count
 
-            # Get alt text from docPr element
+            # Get alt text and decorative flag from docPr element
             doc_pr_els = drawing.findall(
                 f".//{{{_NSMAP['wp']}}}docPr"
             )
             alt_text = ""
             image_name = ""
+            is_decorative = False
             for dp in doc_pr_els:
                 alt_text = dp.get("descr", "").strip()
                 image_name = dp.get("name", "").strip()
+                for dec_el in dp.iter(f"{{{_NSMAP['adec']}}}decorative"):
+                    if dec_el.get("val") in ("1", "true"):
+                        is_decorative = True
                 break
+
+            if is_decorative:
+                continue  # In-place decorative images are skipped by screen readers
 
             # Try to get the embedded image filename from blipFill
             embedded_name = ""

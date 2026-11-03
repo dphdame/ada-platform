@@ -18,6 +18,7 @@ from ada_platform.remediation_engine import (
     apply_interactive_remediation,
     build_tagged_pdf_from_docx,
     contrast_ratio,
+    evaluate_deliverable_gate,
     inspect_document,
 )
 from ada_platform.scanner.docx_scanner import DocxScanner
@@ -201,8 +202,8 @@ def main():
                     )
                     if is_dec:
                         st.caption(
-                            "This graphic will be marked decorative and placed in the header/artifact "
-                            "layer so screen readers skip it cleanly."
+                            "This graphic stays in its exact document position and is marked "
+                            "decorative (`adec:decorative` in Word and `/Artifact` in PDF) so screen readers skip it."
                         )
                         image_decisions[img.index] = {"decorative": True, "alt_text": ""}
                     else:
@@ -328,55 +329,82 @@ def main():
             sr_transcript = generate_transcript(out_docx_path)
             verification = verify_transcript(out_docx_path)
 
-        with st.spinner("Compiling tagged PDF/UA-1 and running 15-check PDF accessibility audit..."):
+        with st.spinner("Compiling tagged PDF/UA-1 and running 16-check PDF accessibility audit..."):
             pdf_qa_report = build_tagged_pdf_from_docx(
                 out_docx_path,
                 out_pdf_path,
                 work_dir=os.path.join(tmpdir, "pdf_build"),
+                language=plan.document_language,
             )
 
-        st.success(
-            f"Remediation complete! Word issues remaining: {post_scan.total_issues} | "
-            f"Screen-reader verifier: {verification.summary()} | "
-            f"PDF 15-check audit: {'ALL PASSED' if pdf_qa_report.get('all_passed') else 'Check warnings'}"
+        gate = evaluate_deliverable_gate(
+            post_scan=post_scan,
+            sr_transcript=sr_transcript,
+            verification=verification,
+            pdf_qa_report=pdf_qa_report,
         )
+
+        if gate["passed"]:
+            st.success(
+                f"{gate['status_label']} — Word issues: {post_scan.total_issues} | "
+                f"Screen-reader verifier: {verification.summary()} | "
+                f"PDF 16-check audit: ALL PASSED"
+            )
+        else:
+            st.error(
+                f"{gate['status_label']}\n\n"
+                + "\n".join(f"- {reason}" for reason in gate["blocking_reasons"])
+                + "\n\nResolve the remaining items above in Step 2 / Step 3 and re-run before publishing."
+            )
 
         # Verification details
         v_col1, v_col2 = st.columns(2)
         with v_col1:
-            with st.expander("Word Screen-Reader Transcript & Verification", expanded=False):
+            with st.expander("Word Screen-Reader Transcript & Verification", expanded=not gate["passed"]):
                 st.markdown(f"**{sr_transcript.summary()}**")
                 st.markdown(f"**{verification.summary()}**")
                 st.text(sr_transcript.text_only[:4000])
         with v_col2:
-            with st.expander("Tagged PDF/UA-1 15-Check QA Report", expanded=False):
+            with st.expander("Tagged PDF/UA-1 16-Check QA Report", expanded=not gate["passed"]):
                 for chk in pdf_qa_report.get("checks", []):
                     icon = "PASS" if chk.get("passed") else "FAIL"
-                    st.markdown(f"- **[{icon}] {chk.get('name')}**: `{chk.get('detail')}`")
+                    chk_name = chk.get("check") or chk.get("name") or "Check"
+                    st.markdown(f"- **[{icon}] {chk_name}**: `{chk.get('detail')}`")
 
-        # Download buttons
+        # Download buttons (fail-closed: Accessible downloads require gate["passed"])
         st.subheader("Download Accessible Deliverables")
         d1, d2, d3 = st.columns(3)
         with d1:
             with open(out_docx_path, "rb") as f:
                 st.download_button(
-                    label=f"Download Accessible Word ({out_docx_name})",
+                    label=(
+                        f"Download Accessible Word ({out_docx_name})"
+                        if gate["passed"]
+                        else "Blocked: Unresolved Accessibility Findings (.docx)"
+                    ),
                     data=f.read(),
-                    file_name=out_docx_name,
+                    file_name=out_docx_name if gate["passed"] else f"{base_stem}_DRAFT_UNRESOLVED.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     type="primary",
+                    disabled=not gate["passed"],
                 )
         with d2:
             with open(out_pdf_path, "rb") as f:
                 st.download_button(
-                    label=f"Download Tagged PDF/UA-1 ({out_pdf_name})",
+                    label=(
+                        f"Download Tagged PDF/UA-1 ({out_pdf_name})"
+                        if gate["passed"]
+                        else "Blocked: Unresolved Accessibility Findings (.pdf)"
+                    ),
                     data=f.read(),
-                    file_name=out_pdf_name,
+                    file_name=out_pdf_name if gate["passed"] else f"{base_stem}_DRAFT_UNRESOLVED.pdf",
                     mime="application/pdf",
                     type="primary",
+                    disabled=not gate["passed"],
                 )
         with d3:
             combined_audit = {
+                "deliverable_gate": gate,
                 "word_remediation_stats": stats,
                 "word_remaining_issues": post_scan.total_issues,
                 "screen_reader_verification": verification.summary(),
