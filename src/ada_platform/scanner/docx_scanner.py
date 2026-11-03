@@ -75,6 +75,8 @@ class DocxScanner(BaseScanner):
         link_issues, link_count = self._check_links(doc, metadata)
         issues.extend(link_issues)
 
+        issues.extend(self._check_colors(doc))
+
         return ScanResult(
             file_path=file_path,
             file_type="docx",
@@ -474,3 +476,47 @@ class DocxScanner(BaseScanner):
             )
 
         return issues, link_count
+
+    # ── Check 7: Color contrast & color-only prose ───────────────
+
+    def _check_colors(self, doc: Document) -> list[Issue]:
+        from ada_platform.remediation_engine import (
+            COLOR_WORDS_RE,
+            audit_color_contrast,
+        )
+
+        issues: list[Issue] = []
+        for item in audit_color_contrast(doc):
+            if not item.passed:
+                issues.append(
+                    Issue.create(
+                        IssueType.LOW_COLOR_CONTRAST,
+                        location=item.location,
+                        description=(
+                            f"{item.role} text ({item.fg_hex} on {item.bg_hex}) has "
+                            f"contrast ratio {item.ratio}:1, below the WCAG 2.1 AA "
+                            f"{item.required_ratio}:1 minimum."
+                        ),
+                        fix_category=FixCategory.SUGGEST,
+                        current_value=f"{item.fg_hex} on {item.bg_hex} ({item.ratio}:1)",
+                        suggested_fix=item.recommended_fg,
+                        metadata_key=item.pair_id,
+                    )
+                )
+
+        for p_idx, p in enumerate(doc.paragraphs, start=1):
+            txt = p.text
+            for m in COLOR_WORDS_RE.finditer(txt):
+                snippet = txt[max(0, m.start() - 20) : m.end() + 20].strip()
+                issues.append(
+                    Issue.create(
+                        IssueType.COLOR_ONLY_INFO,
+                        location=f"Paragraph {p_idx}",
+                        description=(
+                            f'Text refers to color alone ("...{snippet}..."). '
+                            f"Ensure meaning is also conveyed via labels, patterns, or symbols."
+                        ),
+                        current_value=m.group(0),
+                    )
+                )
+        return issues

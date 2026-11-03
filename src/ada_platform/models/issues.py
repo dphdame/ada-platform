@@ -21,6 +21,10 @@ class IssueType(Enum):
     WEAK_LINK_TEXT = "weak_link_text"
     MISSING_FOOTNOTE_LINK = "missing_footnote_link"
     COLOR_ONLY_INFO = "color_only_info"
+    LOW_COLOR_CONTRAST = "low_color_contrast"
+    SMALL_FONT_SIZE = "small_font_size"
+    EMPTY_SPACER_PARAGRAPH = "empty_spacer_paragraph"
+    UNSPACED_SUPERSCRIPT = "unspaced_superscript"
     # PPTX-specific (reserved for Phase 2)
     SLIDE_MISSING_TITLE = "slide_missing_title"
     SLIDE_READING_ORDER = "slide_reading_order"
@@ -55,6 +59,10 @@ ISSUE_SEVERITY: dict[IssueType, Severity] = {
     IssueType.WEAK_LINK_TEXT: Severity.WARNING,
     IssueType.MISSING_FOOTNOTE_LINK: Severity.INFO,
     IssueType.COLOR_ONLY_INFO: Severity.WARNING,
+    IssueType.LOW_COLOR_CONTRAST: Severity.CRITICAL,
+    IssueType.SMALL_FONT_SIZE: Severity.WARNING,
+    IssueType.EMPTY_SPACER_PARAGRAPH: Severity.INFO,
+    IssueType.UNSPACED_SUPERSCRIPT: Severity.WARNING,
     IssueType.SLIDE_MISSING_TITLE: Severity.CRITICAL,
     IssueType.SLIDE_READING_ORDER: Severity.WARNING,
 }
@@ -72,6 +80,10 @@ ISSUE_DEFAULT_FIX: dict[IssueType, FixCategory] = {
     IssueType.WEAK_LINK_TEXT: FixCategory.HUMAN_REVIEW,
     IssueType.MISSING_FOOTNOTE_LINK: FixCategory.SUGGEST,
     IssueType.COLOR_ONLY_INFO: FixCategory.HUMAN_REVIEW,
+    IssueType.LOW_COLOR_CONTRAST: FixCategory.SUGGEST,
+    IssueType.SMALL_FONT_SIZE: FixCategory.SAFE_AUTO,
+    IssueType.EMPTY_SPACER_PARAGRAPH: FixCategory.SAFE_AUTO,
+    IssueType.UNSPACED_SUPERSCRIPT: FixCategory.SAFE_AUTO,
     IssueType.SLIDE_MISSING_TITLE: FixCategory.SAFE_AUTO,
     IssueType.SLIDE_READING_ORDER: FixCategory.HUMAN_REVIEW,
 }

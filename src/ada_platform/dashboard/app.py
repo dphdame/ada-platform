@@ -1,51 +1,71 @@
-"""Streamlit dashboard for the ADA Document Accessibility Platform."""
+"""Streamlit dashboard for the ADA Document Accessibility Platform (Zero-AI Interactive Edition)."""
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
+from pathlib import Path
 
 import streamlit as st
 
-from ada_platform.scanner.docx_scanner import DocxScanner
-from ada_platform.fixer.docx_fixer import DocxFixer
 from ada_platform.metadata.excel_reader import ExcelMetadataReader
-from ada_platform.reporting.exception_report import (
-    generate_json_report,
-    generate_text_report,
-    generate_scan_text_report,
-)
 from ada_platform.qa.screen_reader_sim import generate_transcript
 from ada_platform.qa.transcript_verifier import verify_transcript
+from ada_platform.remediation_engine import (
+    PHD_BRAND_PALETTE,
+    InteractiveRemediationPlan,
+    apply_interactive_remediation,
+    build_tagged_pdf_from_docx,
+    contrast_ratio,
+    inspect_document,
+)
+from ada_platform.scanner.docx_scanner import DocxScanner
+
+
+def _render_color_swatch_html(fg_hex: str, bg_hex: str, label: str) -> str:
+    return (
+        f'<span style="display:inline-block;padding:3px 10px;border-radius:4px;'
+        f"background-color:{bg_hex};color:{fg_hex};border:1px solid #ccc;"
+        f'font-weight:600;font-family:sans-serif;font-size:0.9rem;">'
+        f"{label} ({fg_hex} on {bg_hex})</span>"
+    )
 
 
 def main():
-    st.set_page_config(page_title="ADA Accessibility Platform", layout="wide")
-    st.title("ADA Document Accessibility Platform")
-    st.markdown("Upload a document to scan for accessibility issues and apply fixes.")
+    st.set_page_config(
+        page_title="PHD ADA Document & PDF Compliance Tool",
+        layout="wide",
+    )
+    st.title("ADA Document & Tagged PDF Compliance Tool")
+    st.markdown(
+        "Upload a Word document (`.docx`) to check accessibility, review and fix items "
+        "directly on this page (including color contrast, decorative graphics, headings, "
+        "and links), and download both an **ADA-compliant Word file (`.docx`)** and a "
+        "**tagged PDF/UA-1 file (`.pdf`)**."
+    )
 
-    # Step 1: Upload
-    st.header("Step 1: Upload")
+    # ── Step 1: Upload ──────────────────────────────────────────────────────
+    st.header("Step 1: Upload Word Document")
     col1, col2 = st.columns(2)
     with col1:
         docx_file = st.file_uploader(
-            "Upload a DOCX file",
+            "Upload a Word (.docx) file",
             type=["docx"],
-            help="Word document to check for accessibility issues",
+            help="Word document to inspect and convert into an accessible DOCX + tagged PDF",
         )
     with col2:
         metadata_file = st.file_uploader(
-            "Upload metadata workbook (optional)",
+            "Upload metadata workbook (optional .xlsx)",
             type=["xlsx"],
-            help="Excel workbook with reusable alt text, link text, and document metadata",
+            help="Optional Excel workbook with pre-approved alt text and link titles",
         )
 
     if not docx_file:
-        st.info("Upload a DOCX file to get started.")
+        st.info("Upload a `.docx` file above to begin.")
         return
 
-    # Save uploaded files to temp directory
-    tmpdir = tempfile.mkdtemp()
+    tmpdir = tempfile.mkdtemp(prefix="ada_interactive_")
     docx_path = os.path.join(tmpdir, docx_file.name)
     with open(docx_path, "wb") as f:
         f.write(docx_file.getvalue())
@@ -56,124 +76,317 @@ def main():
         with open(meta_path, "wb") as f:
             f.write(metadata_file.getvalue())
         meta_wb = ExcelMetadataReader().read(meta_path)
-        st.success(f"Loaded metadata from {metadata_file.name}")
+        st.success(f"Loaded metadata workbook: {metadata_file.name}")
 
-    # Step 2: Scan
-    st.header("Step 2: Scan")
+    # ── Step 2: Automated Scan & Color Contrast Audit ──────────────────────
+    st.header("Step 2: Scan Summary & Color Contrast Check")
     scanner = DocxScanner()
     scan_result = scanner.scan(docx_path, metadata=meta_wb)
+    inspection = inspect_document(docx_path)
 
-    st.metric("Total Issues", scan_result.total_issues)
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Auto-fixable", len(scan_result.safe_fixable))
-    with col2:
-        st.metric("Suggested", len(scan_result.suggested))
-    with col3:
-        st.metric("Need Review", len(scan_result.needs_review))
+    failing_colors = [c for c in inspection.contrast_items if not c.passed]
+    weak_links = [lk for lk in inspection.hyperlinks if lk.is_weak_or_url]
+    tables_missing_hdr = [t for t in inspection.tables if not t.has_header_flag]
 
-    st.markdown(f"**{scan_result.summary()}**")
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Images to Review", len(inspection.images))
+    m2.metric("Heading / Style Issues", len(inspection.headings_and_styles))
+    m3.metric("Links Needing Text", len(weak_links))
+    m4.metric("Tables Missing Header", f"{len(tables_missing_hdr)}/{len(inspection.tables)}")
+    m5.metric(
+        "Color Contrast Pairs",
+        f"{len(inspection.contrast_items) - len(failing_colors)}/{len(inspection.contrast_items)} PASS",
+    )
+    m6.metric(
+        "Small Font / Footnotes",
+        inspection.hygiene.small_font_runs_count + inspection.hygiene.unspaced_superscripts_count,
+    )
 
-    # Show scan details
-    with st.expander("Scan Details"):
-        st.text(generate_scan_text_report(scan_result))
-
-    if scan_result.total_issues == 0:
-        st.success("No accessibility issues found. Document looks good.")
-        return
-
-    # Step 3: Review issues requiring human judgment
-    if scan_result.needs_review:
-        st.header("Step 3: Review")
-        st.markdown("These issues need your input:")
-        for issue in scan_result.needs_review:
-            with st.container():
-                st.markdown(f"**{issue.location}**: {issue.description}")
-                if issue.current_value:
-                    st.caption(f"Current: {issue.current_value}")
-
-    # Step 4: Fix
-    st.header("Step 4: Apply Fixes")
-    if st.button("Apply automatic fixes", type="primary"):
-        base, ext = os.path.splitext(docx_file.name)
-        output_name = f"{base}_accessible{ext}"
-        output_path = os.path.join(tmpdir, output_name)
-        report_path = os.path.join(tmpdir, f"{base}_report.json")
-
-        fixer = DocxFixer()
-        fix_result = fixer.fix(docx_path, output_path, scan_result, metadata=meta_wb)
-
-        st.success(fix_result.summary())
-
-        # Show report
-        with st.expander("Full Report"):
-            st.text(generate_text_report(fix_result))
-
-        # Generate JSON report
-        generate_json_report(fix_result, report_path)
-
-        # Step 5: Screen Reader Preview (QI)
-        st.header("Step 5: Screen Reader Preview")
-        sr_transcript = generate_transcript(output_path)
-
-        if sr_transcript.warnings:
-            st.warning(sr_transcript.summary())
-            with st.expander("Screen reader warnings"):
-                for w in sr_transcript.warnings:
-                    st.markdown(f"- **{w.location}**: {w.text}")
-        else:
-            st.success(sr_transcript.summary())
-
-        with st.expander("Full screen reader transcript"):
-            st.text(sr_transcript.text_only)
-
-        # Step 6: Transcript Verification (QI)
-        st.header("Step 6: Transcript Verification")
-        verification = verify_transcript(output_path)
-        if verification.passed and verification.gap_count == 0:
-            st.success(verification.summary())
-        elif verification.passed:
-            st.warning(verification.summary())
-        else:
-            st.error(verification.summary())
-
-        with st.expander("Verification details"):
-            if verification.issues:
-                for issue in verification.issues:
-                    icon = "X" if issue.severity == "error" else "?"
-                    st.markdown(
-                        f"- **[{icon}] {issue.element}** ({issue.location})\n"
-                        f"  - Expected: {issue.expected}\n"
-                        f"  - Found: {issue.found}"
+    # Color Contrast Audit Section
+    with st.expander(
+        f"Color Contrast Audit ({len(inspection.contrast_items)} color pairs checked — "
+        f"{len(failing_colors)} failing)",
+        expanded=bool(failing_colors),
+    ):
+        st.markdown(
+            "Every text and background color combination in your paragraphs, headings, "
+            "links, and table cells is checked against the **WCAG 2.1 AA minimum** "
+            "(`4.5:1` for regular text, `3.0:1` for large text $\\ge 18\\text{ pt}$ or $14\\text{ pt}$ bold)."
+        )
+        color_fg_overrides: dict[str, str] = {}
+        for item in inspection.contrast_items:
+            c_left, c_mid, c_right = st.columns([3, 2, 3])
+            with c_left:
+                st.markdown(
+                    _render_color_swatch_html(item.fg_hex, item.bg_hex, item.role),
+                    unsafe_allow_html=True,
+                )
+                st.caption(f"Sample ({item.location}): \"{item.sample_text}\"")
+            with c_mid:
+                badge = "PASS" if item.passed else "FAIL"
+                st.markdown(
+                    f"**Ratio:** `{item.ratio}:1` (min `{item.required_ratio}:1`) — **{badge}**"
+                )
+            with c_right:
+                if not item.passed:
+                    palette_options = {
+                        f"{name} ({hex_val} -> {contrast_ratio(hex_val, item.bg_hex)}:1)": hex_val
+                        for name, hex_val in PHD_BRAND_PALETTE.items()
+                        if contrast_ratio(hex_val, item.bg_hex) >= item.required_ratio
+                    }
+                    chosen_label = st.selectbox(
+                        f"Fix text color for {item.role}",
+                        options=list(palette_options.keys()),
+                        key=f"color_fix_{item.pair_id}",
                     )
-            else:
-                st.markdown("Every element in the document matches the transcript.")
+                    color_fg_overrides[item.pair_id] = palette_options[chosen_label]
+                else:
+                    st.caption("Meets WCAG 2.1 AA contrast standard.")
 
-        # Step 7: Download
-        st.header("Step 7: Download")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            with open(output_path, "rb") as f:
+        if inspection.color_only_warnings:
+            st.warning(
+                "Prose phrases that reference color alone (confirm labels/patterns are also present):\n"
+                + "\n".join(f"- {w}" for w in inspection.color_only_warnings)
+            )
+
+    # ── Step 3: Interactive Review & Fixes (Zero AI) ────────────────────────
+    st.header("Step 3: Review & Customize Fixes")
+
+    # 3A. Document Metadata & Language
+    st.subheader("3A. Document Title & Language")
+    if inspection.title_needs_attention:
+        st.warning(
+            f"Current Word property title is **`{inspection.core_title or '(blank)'}`**, "
+            f"which does not match the document's main heading (**`{inspection.first_h1_text}`**). "
+            f"We pre-filled the main heading below."
+        )
+    col_t1, col_t2, col_t3 = st.columns([3, 2, 1])
+    with col_t1:
+        doc_title_input = st.text_input(
+            "Document Title (announced first by screen readers and shown in the PDF title bar)",
+            value=inspection.recommended_title,
+        )
+    with col_t2:
+        doc_author_input = st.text_input(
+            "Document Author / Organization",
+            value=inspection.author,
+        )
+    with col_t3:
+        doc_lang_input = st.selectbox(
+            "Language",
+            options=["en-US", "es-US", "vi-VN", "zh-CN", "tl-PH"],
+            index=0,
+        )
+
+    # 3B. Images & Decorative Motifs
+    st.subheader("3B. Images & Decorative Graphics")
+    image_decisions: dict[int, dict[str, object]] = {}
+    if not inspection.images:
+        st.success("No body images requiring review.")
+    else:
+        for img in inspection.images:
+            with st.container(border=True):
+                ic1, ic2 = st.columns([1, 4])
+                with ic1:
+                    if img.image_bytes:
+                        st.image(img.image_bytes, caption=f"{img.name} ({img.location})", width=120)
+                    else:
+                        st.markdown(f"**{img.name}** ({img.location})")
+                with ic2:
+                    default_dec = img.is_decorative or (img.is_floating and not img.current_alt)
+                    is_dec = st.checkbox(
+                        "Purely decorative (skip in screen readers in both Word and PDF)",
+                        value=default_dec,
+                        key=f"img_dec_{img.index}",
+                    )
+                    if is_dec:
+                        st.caption(
+                            "This graphic will be marked decorative and placed in the header/artifact "
+                            "layer so screen readers skip it cleanly."
+                        )
+                        image_decisions[img.index] = {"decorative": True, "alt_text": ""}
+                    else:
+                        alt_val = st.text_input(
+                            f"Description (alt text) for {img.name}",
+                            value=img.current_alt,
+                            placeholder="Describe what this chart or image shows...",
+                            key=f"img_alt_{img.index}",
+                        )
+                        image_decisions[img.index] = {"decorative": False, "alt_text": alt_val}
+
+    # 3C. Headings & Paragraph Styles
+    st.subheader("3C. Headings & Paragraph Styles")
+    paragraph_style_overrides: dict[int, str] = {}
+    style_choices = ["Heading 1", "Heading 2", "Heading 3", "Normal", "Note/Source", "Keep current"]
+    if not inspection.headings_and_styles:
+        st.success("Heading hierarchy and paragraph styles are clean.")
+    else:
+        for item in inspection.headings_and_styles:
+            with st.container(border=True):
+                hc1, hc2 = st.columns([3, 2])
+                with hc1:
+                    st.markdown(
+                        f"**Paragraph {item.para_index}**: `\"{item.text_preview}\"`"
+                    )
+                    st.caption(f"Current style: `{item.current_style}` — {item.reason}")
+                with hc2:
+                    default_idx = (
+                        style_choices.index(item.recommended_style)
+                        if item.recommended_style in style_choices
+                        else 0
+                    )
+                    chosen_style = st.selectbox(
+                        f"Assign style for Paragraph {item.para_index}",
+                        options=style_choices,
+                        index=default_idx,
+                        key=f"para_style_{item.para_index}",
+                    )
+                    if chosen_style != "Keep current":
+                        paragraph_style_overrides[item.para_index] = chosen_style
+
+    # 3D. Hyperlinks
+    st.subheader("3D. Descriptive Hyperlink Text")
+    hyperlink_text_overrides: dict[int, str] = {}
+    if not weak_links:
+        st.success("All hyperlinks already have descriptive display text.")
+    else:
+        st.markdown(
+            "Screen readers read link text out loud. Replace raw URLs (`https://...`) "
+            "or vague phrases (`click here`) with the destination title:"
+        )
+        for lk in weak_links:
+            with st.container(border=True):
+                lc1, lc2 = st.columns([2, 3])
+                with lc1:
+                    st.markdown(f"**Link {lk.link_index}** (Paragraph {lk.para_index})")
+                    st.caption(f"Context: \"{lk.context_snippet}\"")
+                    st.caption(f"Destination URL: `{lk.url}`")
+                with lc2:
+                    new_text = st.text_input(
+                        f"Readable link title for Link {lk.link_index}",
+                        value=lk.suggested_text,
+                        key=f"link_txt_{lk.link_index}",
+                    )
+                    hyperlink_text_overrides[lk.link_index] = new_text
+
+    # 3E. Tables & Formatting Hygiene
+    st.subheader("3E. Tables, Font Sizes & Footnote Formatting")
+    tc1, tc2 = st.columns(2)
+    table_header_flags: dict[int, bool] = {}
+    with tc1:
+        mark_all_tables = st.checkbox(
+            f"Mark Row 1 of all {len(inspection.tables)} table(s) as repeating header rows (<TH>) "
+            "(keeps tables and shaded category rows as-is)",
+            value=True,
+        )
+        for tbl in inspection.tables:
+            table_header_flags[tbl.table_index] = mark_all_tables
+        enforce_font_floor = st.checkbox(
+            f"Raise small text ({inspection.hygiene.small_font_runs_count} runs under 11pt) to 11pt minimum",
+            value=True,
+        )
+    with tc2:
+        bracket_sups = st.checkbox(
+            f"Add space and brackets to superscript footnotes ({inspection.hygiene.unspaced_superscripts_count} found, "
+            "e.g., 'Stroke6' -> 'Stroke [6]')",
+            value=True,
+        )
+        remove_spacers = st.checkbox(
+            f"Remove empty spacer paragraphs ({len(inspection.hygiene.empty_spacer_paras)} found) "
+            f"and hidden zero-width characters ({len(inspection.hygiene.zero_width_char_paras)} found)",
+            value=True,
+        )
+
+    # ── Step 4: Apply Fixes & Build Both Word (.docx) and PDF (.pdf) ────────
+    st.header("Step 4: Apply Fixes & Generate Accessible Word + PDF")
+    if st.button("Apply Fixes & Build Accessible Word + Tagged PDF", type="primary"):
+        base_stem = Path(docx_file.name).stem.replace(" ", "_")
+        out_docx_name = f"{base_stem}_ADA.docx"
+        out_pdf_name = f"{base_stem}_ADA.pdf"
+        out_docx_path = os.path.join(tmpdir, out_docx_name)
+        out_pdf_path = os.path.join(tmpdir, out_pdf_name)
+
+        plan = InteractiveRemediationPlan(
+            document_title=doc_title_input,
+            document_author=doc_author_input,
+            document_language=doc_lang_input,
+            image_decisions=image_decisions,
+            paragraph_style_overrides=paragraph_style_overrides,
+            hyperlink_text_overrides=hyperlink_text_overrides,
+            table_header_flags=table_header_flags,
+            color_fg_overrides=color_fg_overrides,
+            enforce_min_font_size=enforce_font_floor,
+            min_font_size_pt=11.0,
+            remove_empty_spacer_paragraphs=remove_spacers,
+            strip_zero_width_chars=remove_spacers,
+            bracket_and_space_superscripts=bracket_sups,
+        )
+
+        with st.spinner("Applying Word accessibility fixes and verifying screen-reader transcript..."):
+            stats = apply_interactive_remediation(docx_path, out_docx_path, plan)
+            post_scan = scanner.scan(out_docx_path, metadata=meta_wb)
+            sr_transcript = generate_transcript(out_docx_path)
+            verification = verify_transcript(out_docx_path)
+
+        with st.spinner("Compiling tagged PDF/UA-1 and running 15-check PDF accessibility audit..."):
+            pdf_qa_report = build_tagged_pdf_from_docx(
+                out_docx_path,
+                out_pdf_path,
+                work_dir=os.path.join(tmpdir, "pdf_build"),
+            )
+
+        st.success(
+            f"Remediation complete! Word issues remaining: {post_scan.total_issues} | "
+            f"Screen-reader verifier: {verification.summary()} | "
+            f"PDF 15-check audit: {'ALL PASSED' if pdf_qa_report.get('all_passed') else 'Check warnings'}"
+        )
+
+        # Verification details
+        v_col1, v_col2 = st.columns(2)
+        with v_col1:
+            with st.expander("Word Screen-Reader Transcript & Verification", expanded=False):
+                st.markdown(f"**{sr_transcript.summary()}**")
+                st.markdown(f"**{verification.summary()}**")
+                st.text(sr_transcript.text_only[:4000])
+        with v_col2:
+            with st.expander("Tagged PDF/UA-1 15-Check QA Report", expanded=False):
+                for chk in pdf_qa_report.get("checks", []):
+                    icon = "PASS" if chk.get("passed") else "FAIL"
+                    st.markdown(f"- **[{icon}] {chk.get('name')}**: `{chk.get('detail')}`")
+
+        # Download buttons
+        st.subheader("Download Accessible Deliverables")
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            with open(out_docx_path, "rb") as f:
                 st.download_button(
-                    label="Download remediated DOCX",
+                    label=f"Download Accessible Word ({out_docx_name})",
                     data=f.read(),
-                    file_name=output_name,
+                    file_name=out_docx_name,
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    type="primary",
                 )
-        with col2:
-            with open(report_path, "rb") as f:
+        with d2:
+            with open(out_pdf_path, "rb") as f:
                 st.download_button(
-                    label="Download issue report (JSON)",
+                    label=f"Download Tagged PDF/UA-1 ({out_pdf_name})",
                     data=f.read(),
-                    file_name=f"{base}_report.json",
-                    mime="application/json",
+                    file_name=out_pdf_name,
+                    mime="application/pdf",
+                    type="primary",
                 )
-        with col3:
+        with d3:
+            combined_audit = {
+                "word_remediation_stats": stats,
+                "word_remaining_issues": post_scan.total_issues,
+                "screen_reader_verification": verification.summary(),
+                "pdf_qa_audit": pdf_qa_report,
+            }
             st.download_button(
-                label="Download screen reader transcript",
-                data=sr_transcript.text_only,
-                file_name=f"{base}_transcript.txt",
-                mime="text/plain",
+                label="Download QA Audit Receipt (.json)",
+                data=json.dumps(combined_audit, indent=2),
+                file_name=f"{base_stem}_ADA_Audit.json",
+                mime="application/json",
             )
 
 
