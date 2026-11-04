@@ -245,7 +245,9 @@ class TestInteractiveRemediationRoundTrip:
         assert ver.passed is True
         assert ver.gap_count == 0
 
-    def test_non_english_language_propagates_to_docx_and_pdf(self, tmp_path):
+    def test_non_english_language_propagates_to_docx_and_pdf(self, tmp_path, monkeypatch):
+        import ada_platform.remediation_engine as rem_eng
+
         doc = Document()
         doc.add_heading("Informe de Salud de Adultos Mayores", level=1)
         doc.add_paragraph("Resumen de indicadores de salud pública del condado.")
@@ -260,10 +262,27 @@ class TestInteractiveRemediationRoundTrip:
         )
         apply_interactive_remediation(in_path, out_docx, plan)
 
+        # On platforms without lualatex (e.g., Windows CI sandbox), use the Word backend with a simulated raw Word PDF
+        try:
+            rem_eng.resolve_lualatex_binary()
+            has_lualatex = True
+        except RuntimeError:
+            has_lualatex = False
+
+        if not has_lualatex:
+            monkeypatch.setattr(
+                rem_eng,
+                "export_docx_to_tagged_pdf_via_word_windows",
+                lambda _d, pdf_out: _write_raw_word_tagged_pdf(
+                    pdf_out, "Informe de Salud de Adultos Mayores"
+                ),
+            )
+
         qa_report = build_tagged_pdf_from_docx(
             out_docx,
             out_pdf,
             work_dir=str(tmp_path / "pdf_es_build"),
+            backend="latex" if has_lualatex else "word",
         )
         assert qa_report["all_passed"] is True
 
@@ -364,7 +383,6 @@ class TestInteractiveRemediationRoundTrip:
 
     def test_windows_word_backend_postprocesses_td_headers_and_empty_alt(self, tmp_path, monkeypatch):
         """Verify backend='word' converts DOCX via Word exporter and fixes raw Word PDF tags."""
-        import shutil
         import ada_platform.remediation_engine as rem_eng
 
         doc = Document()
@@ -389,38 +407,20 @@ class TestInteractiveRemediationRoundTrip:
         )
         apply_interactive_remediation(in_docx, rem_docx, plan)
 
-        # First produce a real tagged PDF baseline, then inject the two classic raw Word PDF quirks:
+        # Simulate raw Microsoft Word PDF export with the two classic raw Word PDF quirks:
         #   (a) Table header cells tagged as /TD without /Scope
         #   (b) A decorative /Shape StructElem with empty /Alt () ("Element 1" in Acrobat Pro)
-        baseline_pdf = str(tmp_path / "baseline.pdf")
-        build_tagged_pdf_from_docx(
-            rem_docx,
-            baseline_pdf,
-            work_dir=str(tmp_path / "base_build"),
-            backend="latex",
-        )
-
-        def _fake_word_export(docx_path_arg: str, pdf_path_arg: str) -> None:
-            shutil.copyfile(baseline_pdf, pdf_path_arg)
-            raw_doc = fitz.open(pdf_path_arg)
-            for xref in range(1, raw_doc.xref_length()):
-                try:
-                    obj = raw_doc.xref_object(xref)
-                except Exception:
-                    continue
-                if "/Type /StructElem" in obj and "/S /TH" in obj:
-                    # Simulate raw Word export where Row 0 cells are /TD or lack /Scope
-                    raw_doc.xref_set_key(xref, "S", "/TD")
-                    raw_doc.xref_set_key(xref, "A", "null")
-                elif "/Type /StructElem" in obj and "/S /P" in obj:
-                    # Simulate raw Word decorative shape with empty /Alt ()
-                    raw_doc.xref_set_key(xref, "Alt", "()")
-                    break
-            raw_doc.saveIncr()
-            raw_doc.close()
+        raw_unprocessed = str(tmp_path / "raw_word_unprocessed.pdf")
+        _write_raw_word_tagged_pdf(raw_unprocessed, "Windows Word Native Export Test")
+        raw_audit = run_pdf_ua_audit(raw_unprocessed, expected_lang="en-US")
+        assert raw_audit["all_passed"] is False, "Raw Word PDF before post-processing must fail audit"
 
         monkeypatch.setattr(
-            rem_eng, "export_docx_to_tagged_pdf_via_word_windows", _fake_word_export
+            rem_eng,
+            "export_docx_to_tagged_pdf_via_word_windows",
+            lambda _docx_arg, pdf_arg: _write_raw_word_tagged_pdf(
+                pdf_arg, "Windows Word Native Export Test"
+            ),
         )
 
         report = build_tagged_pdf_from_docx(
@@ -431,3 +431,146 @@ class TestInteractiveRemediationRoundTrip:
         )
         assert report["all_passed"] is True
         assert [c["check"] for c in report["checks"]] == list(REQUIRED_PDF_AUDIT_CHECKS)
+
+    def test_windows_powershell_com_script_invocation(self, tmp_path, monkeypatch):
+        """Verify export_docx_to_tagged_pdf_via_word_windows invokes PowerShell COM ExportAsFixedFormat."""
+        import subprocess
+        import sys
+        import ada_platform.remediation_engine as rem_eng
+
+        # Ensure win32com import falls through to the built-in PowerShell COM automation path
+        monkeypatch.setitem(sys.modules, "win32com", None)
+        monkeypatch.setitem(sys.modules, "win32com.client", None)
+
+        in_docx = tmp_path / "sample.docx"
+        out_pdf = tmp_path / "sample_out.pdf"
+        Document().save(str(in_docx))
+
+        captured_cmds: list[list[str]] = []
+
+        def _fake_powershell_run(cmd, **kwargs):
+            captured_cmds.append(list(cmd))
+            _write_raw_word_tagged_pdf(str(out_pdf), "PowerShell COM Export")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(rem_eng.subprocess, "run", _fake_powershell_run)
+
+        rem_eng.export_docx_to_tagged_pdf_via_word_windows(str(in_docx), str(out_pdf))
+        assert len(captured_cmds) == 1
+        ps_cmd = captured_cmds[0]
+        assert ps_cmd[0] == "powershell"
+        assert "-NoProfile" in ps_cmd
+        assert "-NonInteractive" in ps_cmd
+        script_body = ps_cmd[-1]
+        assert "New-Object -ComObject Word.Application" in script_body
+        assert "ExportAsFixedFormat" in script_body
+        assert out_pdf.is_file()
+
+    def test_win32com_word_export_call_contract_and_auto_routing(self, tmp_path, monkeypatch):
+        """Verify sys.platform == 'win32' auto-routes to Word COM via win32com.client.DispatchEx."""
+        import types
+        import sys
+        import ada_platform.remediation_engine as rem_eng
+
+        com_calls: list[tuple] = []
+
+        class FakeWordDoc:
+            def ExportAsFixedFormat(self, **kwargs):
+                com_calls.append(("ExportAsFixedFormat", kwargs))
+                _write_raw_word_tagged_pdf(kwargs["OutputFileName"], "Win32COM Auto Route Test")
+
+            def Close(self, save_changes):
+                com_calls.append(("Close", save_changes))
+
+        class FakeDocuments:
+            def Open(self, path, ReadOnly=True):
+                com_calls.append(("Open", path, ReadOnly))
+                return FakeWordDoc()
+
+        class FakeWordApp:
+            def __init__(self):
+                self.Visible = True
+                self.DisplayAlerts = 1
+                self.Documents = FakeDocuments()
+
+            def Quit(self):
+                com_calls.append(("Quit", self.Visible, self.DisplayAlerts))
+
+        fake_client = types.ModuleType("win32com.client")
+        fake_client.DispatchEx = lambda prog_id: (
+            com_calls.append(("DispatchEx", prog_id)) or FakeWordApp()
+        )
+        fake_win32com = types.ModuleType("win32com")
+        fake_win32com.client = fake_client
+
+        monkeypatch.setitem(sys.modules, "win32com", fake_win32com)
+        monkeypatch.setitem(sys.modules, "win32com.client", fake_client)
+        monkeypatch.setattr(rem_eng.sys, "platform", "win32")
+
+        doc = Document()
+        doc.core_properties.title = "Win32COM Auto Route Test"
+        doc.add_heading("Win32COM Auto Route Test", level=1)
+        doc.add_paragraph("Testing automatic Windows Word COM routing.")
+        in_docx = str(tmp_path / "win32_auto.docx")
+        out_pdf = str(tmp_path / "win32_auto.pdf")
+        doc.save(in_docx)
+
+        report = build_tagged_pdf_from_docx(
+            in_docx,
+            out_pdf,
+            work_dir=str(tmp_path / "win32_work"),
+            backend="auto",
+        )
+        assert report["all_passed"] is True
+        assert com_calls[0] == ("DispatchEx", "Word.Application")
+        assert com_calls[1][0] == "Open" and com_calls[1][2] is True
+        export_kwargs = com_calls[2][1]
+        assert export_kwargs["ExportFormat"] == 17
+        assert export_kwargs["IncludeDocProps"] is True
+        assert export_kwargs["CreateBookmarks"] == 1
+        assert export_kwargs["DocStructureTags"] is True
+        assert com_calls[3] == ("Close", 0)
+        assert com_calls[4] == ("Quit", False, 0)
+
+
+def _write_raw_word_tagged_pdf(pdf_path: str, title: str) -> None:
+    """Create a realistic raw Word-exported tagged PDF with /TD header cells and empty /Alt () shape."""
+    doc = fitz.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((72, 100), title, fontsize=16)
+    page.insert_text((72, 130), "Body paragraph for Windows Word native PDF export.", fontsize=11)
+    doc.set_toc([[1, title, 1]])
+
+    stream_xref = page.get_contents()[0]
+    orig_bytes = doc.xref_stream(stream_xref)
+    doc.update_stream(stream_xref, b"/P <</MCID 0>> BDC\n" + orig_bytes + b"\nEMC\n")
+
+    st_root = doc.get_new_xref()
+    p_elem = doc.get_new_xref()
+    shape_elem = doc.get_new_xref()
+    tbl_elem = doc.get_new_xref()
+    tr_elem = doc.get_new_xref()
+    td1_elem = doc.get_new_xref()
+    td2_elem = doc.get_new_xref()
+
+    doc.update_object(td1_elem, f"<< /Type /StructElem /S /TD /P {tr_elem} 0 R >>")
+    doc.update_object(td2_elem, f"<< /Type /StructElem /S /TD /P {tr_elem} 0 R >>")
+    doc.update_object(
+        tr_elem,
+        f"<< /Type /StructElem /S /TR /P {tbl_elem} 0 R /K [{td1_elem} 0 R {td2_elem} 0 R] >>",
+    )
+    doc.update_object(
+        tbl_elem,
+        f"<< /Type /StructElem /S /Table /P {st_root} 0 R /K [{tr_elem} 0 R] >>",
+    )
+    doc.update_object(p_elem, f"<< /Type /StructElem /S /P /P {st_root} 0 R /K 0 >>")
+    doc.update_object(
+        shape_elem, f"<< /Type /StructElem /S /Shape /P {st_root} 0 R /Alt () >>"
+    )
+    doc.update_object(
+        st_root,
+        f"<< /Type /StructTreeRoot /K [{p_elem} 0 R {shape_elem} 0 R {tbl_elem} 0 R] >>",
+    )
+    doc.xref_set_key(doc.pdf_catalog(), "StructTreeRoot", f"{st_root} 0 R")
+    doc.save(pdf_path)
+    doc.close()

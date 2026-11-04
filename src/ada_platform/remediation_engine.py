@@ -1312,12 +1312,15 @@ def export_docx_to_tagged_pdf_via_word_windows(
         "$word = New-Object -ComObject Word.Application; "
         "$word.Visible = $false; "
         "$word.DisplayAlerts = 0; "
+        "$doc = $null; "
         "try { "
         f"  $doc = $word.Documents.Open('{ps_docx}', $false, $true); "
-        "  try { "
-        f"    $doc.ExportAsFixedFormat('{ps_pdf}', 17, $false, 0, 0, 1, 1, 0, $true, $true, 1, $true, $true, $false); "
-        "  } finally { $doc.Close(0); } "
-        "} finally { $word.Quit(); }"
+        f"  $doc.ExportAsFixedFormat('{ps_pdf}', 17, $false, 0, 0, 1, 1, 0, $true, $true, 1, $true, $true, $false); "
+        "} finally { "
+        "  if ($null -ne $doc) { $doc.Close(0); } "
+        "  $word.Quit(); "
+        "  [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($word); "
+        "}"
     )
     res = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
@@ -2359,7 +2362,7 @@ def build_tagged_pdf_from_docx(
 
     tex_lines.append(r"\end{document}")
     tex_file = tex_dir / "document_ada.tex"
-    tex_file.write_text("\n".join(tex_lines))
+    tex_file.write_text("\n".join(tex_lines), encoding="utf-8")
 
     # Run lualatex twice
     lualatex_bin = resolve_lualatex_binary()

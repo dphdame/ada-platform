@@ -49,26 +49,34 @@ class TestCleanInstallAndRuntime:
         wheel_dir.mkdir()
         clean_venv = tmp_path / "clean_venv"
 
-        # 1. Build wheel from source using offline uv cache
+        # 1. Build wheel from source (offline-first with online fallback for fresh CI sandboxes)
+        build_cmd = [
+            uv_bin,
+            "build",
+            "--wheel",
+            "--offline",
+            "--out-dir",
+            str(wheel_dir),
+            str(REPO_ROOT),
+        ]
         build_res = subprocess.run(
-            [
-                uv_bin,
-                "build",
-                "--wheel",
-                "--offline",
-                "--out-dir",
-                str(wheel_dir),
-                str(REPO_ROOT),
-            ],
+            build_cmd,
             capture_output=True,
             text=True,
             check=False,
         )
+        if build_res.returncode != 0:
+            build_res = subprocess.run(
+                [c for c in build_cmd if c != "--offline"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
         assert build_res.returncode == 0, f"Wheel build failed:\n{build_res.stderr}"
         wheels = list(wheel_dir.glob("ada_platform-*.whl"))
         assert len(wheels) == 1
 
-        # 2. Create a clean virtualenv and install the wheel offline from uv cache
+        # 2. Create a clean virtualenv and install the wheel
         venv_res = subprocess.run(
             [uv_bin, "venv", str(clean_venv)],
             capture_output=True,
@@ -77,25 +85,38 @@ class TestCleanInstallAndRuntime:
         )
         assert venv_res.returncode == 0, f"venv creation failed:\n{venv_res.stderr}"
 
-        clean_py = clean_venv / "bin" / "python"
+        if sys.platform == "win32":
+            clean_py = clean_venv / "Scripts" / "python.exe"
+            installed_cli = clean_venv / "Scripts" / "ada-platform.exe"
+        else:
+            clean_py = clean_venv / "bin" / "python"
+            installed_cli = clean_venv / "bin" / "ada-platform"
+
+        install_cmd = [
+            uv_bin,
+            "pip",
+            "install",
+            "--python",
+            str(clean_py),
+            "--offline",
+            str(wheels[0]),
+        ]
         install_res = subprocess.run(
-            [
-                uv_bin,
-                "pip",
-                "install",
-                "--python",
-                str(clean_py),
-                "--offline",
-                str(wheels[0]),
-            ],
+            install_cmd,
             capture_output=True,
             text=True,
             check=False,
         )
-        assert install_res.returncode == 0, f"Offline wheel install failed:\n{install_res.stderr}"
+        if install_res.returncode != 0:
+            install_res = subprocess.run(
+                [c for c in install_cmd if c != "--offline"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        assert install_res.returncode == 0, f"Wheel install failed:\n{install_res.stderr}"
 
         # 3. Run the installed `ada-platform doctor` and `ada-platform ui --check` from tmp_path (outside repo)
-        installed_cli = clean_venv / "bin" / "ada-platform"
         assert installed_cli.is_file()
         doc_res = subprocess.run(
             [str(installed_cli), "doctor"],
@@ -123,6 +144,33 @@ class TestCleanInstallAndRuntime:
         res = runner.invoke(cli, ["doctor"])
         assert res.exit_code == 0, res.output
         assert "RESULT: READY" in res.output
+
+    def test_doctor_cli_windows_mode(self, monkeypatch):
+        """When running on Windows (sys.platform == 'win32'), `doctor` checks PowerShell COM readiness."""
+        import shutil
+        import ada_platform.cli.main as cli_main
+
+        monkeypatch.setattr(cli_main.sys, "platform", "win32")
+        monkeypatch.setattr(
+            shutil,
+            "which",
+            lambda cmd: (
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+                if cmd == "powershell"
+                else None
+            ),
+        )
+        runner = CliRunner()
+        res = runner.invoke(cli, ["doctor"])
+        assert res.exit_code == 0, res.output
+        assert "Windows Microsoft Word COM via PowerShell" in res.output
+        assert "RESULT: READY" in res.output
+
+        # Also verify fail-closed behavior if PowerShell is missing on Windows
+        monkeypatch.setattr(shutil, "which", lambda _cmd: None)
+        res_fail = runner.invoke(cli, ["doctor"])
+        assert res_fail.exit_code == 1
+        assert "RESULT: FAILED" in res_fail.output
 
     def test_streamlit_dashboard_renders_cleanly_via_apptest(self):
         """Headless AppTest verifies `app.py` renders initial UI with zero uncaught exceptions."""
