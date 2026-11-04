@@ -1253,6 +1253,24 @@ def _format_cell_latex(cell) -> str:
     return "".join(out).strip()
 
 
+def resolve_lualatex_binary() -> str:
+    """Locate the lualatex executable across PATH and standard TeX Live locations."""
+    found = shutil.which("lualatex")
+    if found:
+        return found
+    for candidate in (
+        "/Library/TeX/texbin/lualatex",
+        "/opt/homebrew/bin/lualatex",
+        "/usr/local/bin/lualatex",
+        "/usr/bin/lualatex",
+    ):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise RuntimeError(
+        "lualatex binary not found on PATH or standard TeX Live locations (/Library/TeX/texbin/lualatex)."
+    )
+
+
 def _extract_document_language(doc: Document, default: str = "en-US") -> str:
     """Read the BCP-47 language tag from a DOCX's settings or styles."""
     if doc.settings and doc.settings.element is not None:
@@ -2234,9 +2252,10 @@ def build_tagged_pdf_from_docx(
     tex_file.write_text("\n".join(tex_lines))
 
     # Run lualatex twice
+    lualatex_bin = resolve_lualatex_binary()
     for pass_num in (1, 2):
         res = subprocess.run(
-            ["lualatex", "-interaction=nonstopmode", "-halt-on-error", tex_file.name],
+            [lualatex_bin, "-interaction=nonstopmode", "-halt-on-error", tex_file.name],
             cwd=str(tex_dir),
             capture_output=True,
             text=True,

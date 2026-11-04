@@ -235,5 +235,140 @@ def init_workbook(output: str):
     click.echo("Sheets: Documents, Images, Charts, Links, Tables, Slides")
 
 
+@cli.command("doctor")
+def doctor():
+    """Verify that all Python dependencies, dashboard UI, and LuaLaTeX are installed and ready."""
+    import importlib
+    from pathlib import Path
+    from ada_platform.remediation_engine import resolve_lualatex_binary
+    import ada_platform.dashboard.app as dashboard_app
+
+    required_modules = [
+        ("docx", "python-docx"),
+        ("lxml", "lxml"),
+        ("openpyxl", "openpyxl"),
+        ("click", "click"),
+        ("streamlit", "streamlit"),
+        ("pymupdf", "pymupdf"),
+    ]
+    all_ok = True
+    click.echo("ADA Platform Environment & Installation Check")
+    click.echo("=" * 50)
+    for mod_name, pkg_name in required_modules:
+        try:
+            importlib.import_module(mod_name)
+            click.echo(f"  [PASS] Python package '{pkg_name}' ({mod_name})")
+        except Exception as exc:
+            all_ok = False
+            click.echo(f"  [FAIL] Python package '{pkg_name}' ({mod_name}): {exc}")
+
+    app_file = Path(dashboard_app.__file__).resolve()
+    if app_file.is_file():
+        click.echo(f"  [PASS] Dashboard entry point: {app_file}")
+    else:
+        all_ok = False
+        click.echo(f"  [FAIL] Dashboard entry point missing: {app_file}")
+
+    try:
+        lualatex_bin = resolve_lualatex_binary()
+        click.echo(f"  [PASS] Tagged PDF compiler (lualatex): {lualatex_bin}")
+    except Exception as exc:
+        all_ok = False
+        click.echo(f"  [FAIL] Tagged PDF compiler (lualatex): {exc}")
+
+    click.echo("=" * 50)
+    if all_ok:
+        click.echo("RESULT: READY (all runtime dependencies and compilers verified)")
+        raise SystemExit(0)
+    else:
+        click.echo("RESULT: FAILED (missing one or more required components)")
+        raise SystemExit(1)
+
+
+@cli.command("ui")
+@click.option("--port", default=8501, show_default=True, type=int, help="Port to bind the Streamlit UI")
+@click.option("--headless", is_flag=True, help="Run Streamlit without auto-opening a browser tab")
+@click.option(
+    "--check",
+    is_flag=True,
+    help="Start the UI server on a local test port, verify HTTP health (/_stcore/health), and exit",
+)
+def ui(port: int, headless: bool, check: bool):
+    """Launch the interactive ADA Document & PDF Compliance web app."""
+    import socket
+    import subprocess
+    import time
+    import urllib.request
+    from pathlib import Path
+    import ada_platform.dashboard.app as dashboard_app
+
+    app_file = Path(dashboard_app.__file__).resolve()
+
+    if check:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            test_port = s.getsockname()[1]
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "streamlit",
+            "run",
+            str(app_file),
+            "--server.headless=true",
+            "--server.address=127.0.0.1",
+            f"--server.port={test_port}",
+            "--browser.gatherUsageStats=false",
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        health_url = f"http://127.0.0.1:{test_port}/_stcore/health"
+        healthy = False
+        try:
+            deadline = time.time() + 15.0
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    break
+                try:
+                    with urllib.request.urlopen(health_url, timeout=1.0) as resp:
+                        body = resp.read().decode("utf-8", errors="replace").strip()
+                        if resp.status == 200 and body == "ok":
+                            healthy = True
+                            break
+                except Exception:
+                    time.sleep(0.25)
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+        if healthy:
+            click.echo(f"UI_CHECK_PASS: Streamlit server responded 'ok' at {health_url}")
+            raise SystemExit(0)
+        else:
+            out = proc.stdout.read() if proc.stdout else ""
+            click.echo(f"UI_CHECK_FAIL: Streamlit server failed health check.\n{out[-1000:]}")
+            raise SystemExit(1)
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(app_file),
+        f"--server.port={port}",
+        "--browser.gatherUsageStats=false",
+    ]
+    if headless:
+        cmd.append("--server.headless=true")
+    raise SystemExit(subprocess.call(cmd))
+
+
 if __name__ == "__main__":
     cli()
