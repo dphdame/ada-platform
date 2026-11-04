@@ -361,3 +361,73 @@ class TestInteractiveRemediationRoundTrip:
         )
         assert gate_spoofed["passed"] is False
         assert any("Table headers (TH cells)" in r for r in gate_spoofed["blocking_reasons"])
+
+    def test_windows_word_backend_postprocesses_td_headers_and_empty_alt(self, tmp_path, monkeypatch):
+        """Verify backend='word' converts DOCX via Word exporter and fixes raw Word PDF tags."""
+        import shutil
+        import ada_platform.remediation_engine as rem_eng
+
+        doc = Document()
+        doc.core_properties.title = "Windows Word Native Export Test"
+        doc.add_heading("Windows Word Native Export Test", level=1)
+        doc.add_paragraph("Body paragraph for Windows Word native PDF export.")
+        tbl = doc.add_table(rows=2, cols=2)
+        tbl.cell(0, 0).text = "Metric"
+        tbl.cell(0, 1).text = "Value"
+        tbl.cell(1, 0).text = "Seniors"
+        tbl.cell(1, 1).text = "20%"
+
+        in_docx = str(tmp_path / "win_in.docx")
+        rem_docx = str(tmp_path / "win_ADA.docx")
+        out_pdf = str(tmp_path / "win_ADA.pdf")
+        doc.save(in_docx)
+
+        plan = InteractiveRemediationPlan(
+            document_title="Windows Word Native Export Test",
+            document_language="en-US",
+            table_header_flags={1: True},
+        )
+        apply_interactive_remediation(in_docx, rem_docx, plan)
+
+        # First produce a real tagged PDF baseline, then inject the two classic raw Word PDF quirks:
+        #   (a) Table header cells tagged as /TD without /Scope
+        #   (b) A decorative /Shape StructElem with empty /Alt () ("Element 1" in Acrobat Pro)
+        baseline_pdf = str(tmp_path / "baseline.pdf")
+        build_tagged_pdf_from_docx(
+            rem_docx,
+            baseline_pdf,
+            work_dir=str(tmp_path / "base_build"),
+            backend="latex",
+        )
+
+        def _fake_word_export(docx_path_arg: str, pdf_path_arg: str) -> None:
+            shutil.copyfile(baseline_pdf, pdf_path_arg)
+            raw_doc = fitz.open(pdf_path_arg)
+            for xref in range(1, raw_doc.xref_length()):
+                try:
+                    obj = raw_doc.xref_object(xref)
+                except Exception:
+                    continue
+                if "/Type /StructElem" in obj and "/S /TH" in obj:
+                    # Simulate raw Word export where Row 0 cells are /TD or lack /Scope
+                    raw_doc.xref_set_key(xref, "S", "/TD")
+                    raw_doc.xref_set_key(xref, "A", "null")
+                elif "/Type /StructElem" in obj and "/S /P" in obj:
+                    # Simulate raw Word decorative shape with empty /Alt ()
+                    raw_doc.xref_set_key(xref, "Alt", "()")
+                    break
+            raw_doc.saveIncr()
+            raw_doc.close()
+
+        monkeypatch.setattr(
+            rem_eng, "export_docx_to_tagged_pdf_via_word_windows", _fake_word_export
+        )
+
+        report = build_tagged_pdf_from_docx(
+            rem_docx,
+            out_pdf,
+            work_dir=str(tmp_path / "win_build"),
+            backend="word",
+        )
+        assert report["all_passed"] is True
+        assert [c["check"] for c in report["checks"]] == list(REQUIRED_PDF_AUDIT_CHECKS)

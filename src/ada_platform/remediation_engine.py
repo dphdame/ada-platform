@@ -1253,6 +1253,84 @@ def _format_cell_latex(cell) -> str:
     return "".join(out).strip()
 
 
+def export_docx_to_tagged_pdf_via_word_windows(
+    remediated_docx_path: str,
+    output_pdf_path: str,
+) -> None:
+    """Export a remediated .docx to a tagged PDF on Windows using Microsoft Word's ExportAsFixedFormat.
+
+    Uses Word's native PDF exporter with:
+      - ExportFormat = 17 (wdExportFormatPDF)
+      - IncludeDocProps = True (title, author, metadata)
+      - CreateBookmarks = 1 (wdExportCreateHeadingBookmarks)
+      - DocStructureTags = True (accessibility structure tags)
+    Supports both pywin32 (win32com.client) and zero-dependency Windows PowerShell COM automation.
+    """
+    abs_docx = str(Path(remediated_docx_path).resolve())
+    abs_pdf = str(Path(output_pdf_path).resolve())
+
+    # 1. Try win32com if installed
+    try:
+        import win32com.client  # type: ignore
+
+        word = win32com.client.DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0
+        try:
+            doc = word.Documents.Open(abs_docx, ReadOnly=True)
+            try:
+                doc.ExportAsFixedFormat(
+                    OutputFileName=abs_pdf,
+                    ExportFormat=17,          # wdExportFormatPDF
+                    OpenAfterExport=False,
+                    OptimizeFor=0,            # wdExportOptimizeForPrint
+                    Range=0,                  # wdExportAllDocument
+                    From=1,
+                    To=1,
+                    Item=0,                   # wdExportDocumentContent
+                    IncludeDocProps=True,
+                    KeepIRM=True,
+                    CreateBookmarks=1,        # wdExportCreateHeadingBookmarks
+                    DocStructureTags=True,    # Accessibility structure tags
+                    BitmapMissingFonts=True,
+                    UseISO19005_1=False,
+                )
+            finally:
+                doc.Close(0)
+        finally:
+            word.Quit()
+        if os.path.isfile(abs_pdf):
+            return
+    except ImportError:
+        pass
+
+    # 2. Fallback to built-in Windows PowerShell COM automation (zero Python C-extensions required)
+    ps_docx = abs_docx.replace("'", "''")
+    ps_pdf = abs_pdf.replace("'", "''")
+    ps_script = (
+        "$ErrorActionPreference = 'Stop'; "
+        "$word = New-Object -ComObject Word.Application; "
+        "$word.Visible = $false; "
+        "$word.DisplayAlerts = 0; "
+        "try { "
+        f"  $doc = $word.Documents.Open('{ps_docx}', $false, $true); "
+        "  try { "
+        f"    $doc.ExportAsFixedFormat('{ps_pdf}', 17, $false, 0, 0, 1, 1, 0, $true, $true, 1, $true, $true, $false); "
+        "  } finally { $doc.Close(0); } "
+        "} finally { $word.Quit(); }"
+    )
+    res = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode != 0 or not os.path.isfile(abs_pdf):
+        raise RuntimeError(
+            f"Microsoft Word PDF export failed (exit {res.returncode}): {res.stderr or res.stdout}"
+        )
+
+
 def resolve_lualatex_binary() -> str:
     """Locate the lualatex executable across PATH and standard TeX Live locations."""
     found = shutil.which("lualatex")
@@ -1411,8 +1489,12 @@ def postprocess_tagged_pdf(
                             cell_xref, "A", "<< /O /Table /Scope /Column >>"
                         )
 
-        # 2. Convert any accidental filepath /Alt on /Figure to /Artifact without /Alt
-        if re.search(r"/S\s+/Figure\b", obj):
+        # 2. Clean up empty /Alt () or accidental filepath /Alt on /Figure or /Shape
+        if re.search(r"/Alt\s*\(\s*\)", obj):
+            if re.search(r"/S\s+/(Figure|Shape)\b", obj):
+                pdf_doc.xref_set_key(xref, "S", "/Artifact")
+            pdf_doc.xref_set_key(xref, "Alt", "null")
+        elif re.search(r"/S\s+/(Figure|Shape)\b", obj):
             alt_text = None
             alt_match = re.search(r"/Alt\s*\(([^)]*)\)", obj)
             if alt_match:
@@ -1420,8 +1502,10 @@ def postprocess_tagged_pdf(
             else:
                 ak = pdf_doc.xref_get_key(xref, "Alt")
                 if ak[0] != "null":
-                    alt_text = ak[1]
-            if alt_text and filepath_pattern.search(alt_text):
+                    alt_text = ak[1].strip("()")
+            if alt_text is not None and (
+                not alt_text.strip() or filepath_pattern.search(alt_text)
+            ):
                 pdf_doc.xref_set_key(xref, "S", "/Artifact")
                 pdf_doc.xref_set_key(xref, "Alt", "null")
 
@@ -2033,8 +2117,16 @@ def build_tagged_pdf_from_docx(
     output_pdf_path: str,
     work_dir: Optional[str] = None,
     language: Optional[str] = None,
+    backend: str = "auto",
 ) -> dict:
-    """Compile a tagged PDF/UA-1 file from a remediated DOCX and run the mandatory 16-check QA audit."""
+    """Compile a tagged PDF file from a remediated DOCX and run the mandatory 16-check QA audit.
+
+    On Windows (`backend="auto"` when `sys.platform == "win32"`, or `backend="word"`),
+    uses Microsoft Word's native `ExportAsFixedFormat(DocStructureTags=True)` directly
+    on the remediated `.docx` (preserving exact Word layout with zero TeX dependency),
+    then runs `postprocess_tagged_pdf` (promoting `<TH /Scope /Column>` and cleaning
+    decorative `/Artifact` tags) and `run_pdf_ua_audit`.
+    """
     docx_p = Path(remediated_docx_path)
     out_pdf_p = Path(output_pdf_path)
     tex_dir = Path(work_dir) if work_dir else out_pdf_p.parent / "_pdf_build"
@@ -2046,6 +2138,24 @@ def build_tagged_pdf_from_docx(
         doc.core_properties.author or "Santa Clara County Public Health Department"
     ).strip()
     doc_lang = (language or _extract_document_language(doc, "en-US")).strip() or "en-US"
+
+    effective_backend = (
+        ("word" if sys.platform == "win32" else "latex")
+        if backend == "auto"
+        else backend
+    )
+
+    compiled_pdf = tex_dir / "document_ada.pdf"
+    if effective_backend == "word":
+        export_docx_to_tagged_pdf_via_word_windows(str(docx_p), str(compiled_pdf))
+        postprocess_tagged_pdf(
+            str(compiled_pdf),
+            str(out_pdf_p),
+            title_str=title_str,
+            author_str=author_str,
+            doc_lang=doc_lang,
+        )
+        return run_pdf_ua_audit(str(out_pdf_p), expected_lang=doc_lang)
 
     hdr_imgs = _extract_header_footer_images(doc, tex_dir)
     hdr_left_tex = rf"\small\color{{phdheader}}\textbf{{{_latex_escape(title_str)}}}"

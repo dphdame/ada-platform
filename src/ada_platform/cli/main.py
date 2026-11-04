@@ -269,12 +269,21 @@ def doctor():
         all_ok = False
         click.echo(f"  [FAIL] Dashboard entry point missing: {app_file}")
 
-    try:
-        lualatex_bin = resolve_lualatex_binary()
-        click.echo(f"  [PASS] Tagged PDF compiler (lualatex): {lualatex_bin}")
-    except Exception as exc:
-        all_ok = False
-        click.echo(f"  [FAIL] Tagged PDF compiler (lualatex): {exc}")
+    if sys.platform == "win32":
+        import shutil
+
+        if shutil.which("powershell"):
+            click.echo("  [PASS] Tagged PDF exporter (Windows Microsoft Word COM via PowerShell)")
+        else:
+            all_ok = False
+            click.echo("  [FAIL] Tagged PDF exporter: Windows PowerShell not found")
+    else:
+        try:
+            lualatex_bin = resolve_lualatex_binary()
+            click.echo(f"  [PASS] Tagged PDF compiler (lualatex fallback): {lualatex_bin}")
+        except Exception as exc:
+            all_ok = False
+            click.echo(f"  [FAIL] Tagged PDF compiler (lualatex fallback): {exc}")
 
     click.echo("=" * 50)
     if all_ok:
