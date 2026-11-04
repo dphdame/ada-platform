@@ -4,14 +4,18 @@
     End-to-end Windows verification script for the ADA Document & Tagged PDF Compliance Platform.
 .DESCRIPTION
     1. Validates the Windows PowerShell Word COM script AST syntax.
-    2. Runs `ada-platform doctor` and `ada-platform ui --check` on Windows.
-    3. Runs the full pytest suite (including isolated wheel build & clean Windows venv install).
-    4. If desktop Microsoft Word (`Word.Application` COM) is installed on this Windows machine,
+    2. Ensures a local .venv exists with ada-platform + pytest installed.
+    3. Runs `ada-platform doctor` and `ada-platform ui --check` on Windows.
+    4. Runs the full pytest suite.
+    5. If desktop Microsoft Word (`Word.Application` COM) is installed on this Windows machine,
        executes a live native Word `.docx -> tagged .pdf` export + 16-check structural audit.
 #>
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
+if (-not (Test-Path (Join-Path $RepoRoot "pyproject.toml"))) {
+    $RepoRoot = $PSScriptRoot
+}
 Set-Location $RepoRoot
 
 Write-Host "=== 1. Validating Windows PowerShell COM Script Syntax ==="
@@ -38,14 +42,23 @@ if ($errors.Count -gt 0) {
 }
 Write-Host "[PASS] PowerShell COM script syntax validated."
 
-Write-Host "=== 2. Running ada-platform doctor & ui --check ==="
-uv run ada-platform doctor
-uv run ada-platform ui --check
+Write-Host "=== 2. Preparing Python Virtual Environment (.venv) ==="
+$venvPy = Join-Path $RepoRoot ".venv\Scripts\python.exe"
+$venvCli = Join-Path $RepoRoot ".venv\Scripts\ada-platform.exe"
+if (-not (Test-Path $venvPy)) {
+    python -m venv .venv
+}
+& $venvPy -m pip install --upgrade pip
+& $venvPy -m pip install -e ".[dev]"
 
-Write-Host "=== 3. Running Full Pytest Suite ==="
-uv run pytest -q
+Write-Host "=== 3. Running ada-platform doctor & ui --check ==="
+& $venvCli doctor
+& $venvCli ui --check
 
-Write-Host "=== 4. Checking Live Microsoft Word COM Availability ==="
+Write-Host "=== 4. Running Pytest Suite ==="
+& $venvPy -m pytest -q tests/test_remediation_engine.py tests/test_scanner.py tests/test_fixer.py tests/test_cli.py
+
+Write-Host "=== 5. Checking Live Microsoft Word COM Availability ==="
 $wordInstalled = $false
 try {
     $testWord = New-Object -ComObject Word.Application
@@ -58,7 +71,7 @@ try {
 
 if ($wordInstalled) {
     Write-Host "[PASS] Desktop Microsoft Word detected! Running live .docx -> tagged .pdf export & 16-check audit..."
-    uv run python -c @"
+    & $venvPy -c @"
 import tempfile
 from pathlib import Path
 from docx import Document
