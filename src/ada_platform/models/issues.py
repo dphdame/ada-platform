@@ -13,11 +13,18 @@ class IssueType(Enum):
     MISSING_TITLE = "missing_title"
     MISSING_LANGUAGE = "missing_language"
     HEADING_SKIP = "heading_skip"
+    HEADING_FIRST_NOT_H1 = "heading_first_not_h1"
+    HEADING_MULTIPLE_H1 = "heading_multiple_h1"
     HEADING_BOLD_NOT_STYLE = "heading_bold_not_style"
     MISSING_ALT_TEXT = "missing_alt_text"
     FILEPATH_ALT_TEXT = "filepath_alt_text"
+    ALT_TEXT_REDUNDANT_PREFIX = "alt_text_redundant_prefix"
+    ALT_TEXT_TOO_LONG = "alt_text_too_long"
+    DECORATIVE_IMAGE_HAS_ALT = "decorative_image_has_alt"
     TABLE_NO_HEADER = "table_no_header"
     TABLE_COMPLEX = "table_complex"
+    TABLE_MERGED_CELLS = "table_merged_cells"
+    TABLE_EMPTY_CELLS = "table_empty_cells"
     WEAK_LINK_TEXT = "weak_link_text"
     MISSING_FOOTNOTE_LINK = "missing_footnote_link"
     COLOR_ONLY_INFO = "color_only_info"
@@ -25,6 +32,7 @@ class IssueType(Enum):
     SMALL_FONT_SIZE = "small_font_size"
     EMPTY_SPACER_PARAGRAPH = "empty_spacer_paragraph"
     UNSPACED_SUPERSCRIPT = "unspaced_superscript"
+    TEXT_JUSTIFIED = "text_justified"
     # PPTX-specific (reserved for Phase 2)
     SLIDE_MISSING_TITLE = "slide_missing_title"
     SLIDE_READING_ORDER = "slide_reading_order"
@@ -51,11 +59,18 @@ ISSUE_SEVERITY: dict[IssueType, Severity] = {
     IssueType.MISSING_TITLE: Severity.CRITICAL,
     IssueType.MISSING_LANGUAGE: Severity.CRITICAL,
     IssueType.HEADING_SKIP: Severity.WARNING,
+    IssueType.HEADING_FIRST_NOT_H1: Severity.WARNING,
+    IssueType.HEADING_MULTIPLE_H1: Severity.WARNING,
     IssueType.HEADING_BOLD_NOT_STYLE: Severity.WARNING,
     IssueType.MISSING_ALT_TEXT: Severity.CRITICAL,
     IssueType.FILEPATH_ALT_TEXT: Severity.CRITICAL,
+    IssueType.ALT_TEXT_REDUNDANT_PREFIX: Severity.WARNING,
+    IssueType.ALT_TEXT_TOO_LONG: Severity.WARNING,
+    IssueType.DECORATIVE_IMAGE_HAS_ALT: Severity.WARNING,
     IssueType.TABLE_NO_HEADER: Severity.CRITICAL,
     IssueType.TABLE_COMPLEX: Severity.WARNING,
+    IssueType.TABLE_MERGED_CELLS: Severity.WARNING,
+    IssueType.TABLE_EMPTY_CELLS: Severity.WARNING,
     IssueType.WEAK_LINK_TEXT: Severity.WARNING,
     IssueType.MISSING_FOOTNOTE_LINK: Severity.INFO,
     IssueType.COLOR_ONLY_INFO: Severity.WARNING,
@@ -63,6 +78,7 @@ ISSUE_SEVERITY: dict[IssueType, Severity] = {
     IssueType.SMALL_FONT_SIZE: Severity.WARNING,
     IssueType.EMPTY_SPACER_PARAGRAPH: Severity.INFO,
     IssueType.UNSPACED_SUPERSCRIPT: Severity.WARNING,
+    IssueType.TEXT_JUSTIFIED: Severity.WARNING,
     IssueType.SLIDE_MISSING_TITLE: Severity.CRITICAL,
     IssueType.SLIDE_READING_ORDER: Severity.WARNING,
 }
@@ -72,11 +88,18 @@ ISSUE_DEFAULT_FIX: dict[IssueType, FixCategory] = {
     IssueType.MISSING_TITLE: FixCategory.SAFE_AUTO,
     IssueType.MISSING_LANGUAGE: FixCategory.SAFE_AUTO,
     IssueType.HEADING_SKIP: FixCategory.SUGGEST,
+    IssueType.HEADING_FIRST_NOT_H1: FixCategory.SUGGEST,
+    IssueType.HEADING_MULTIPLE_H1: FixCategory.SUGGEST,
     IssueType.HEADING_BOLD_NOT_STYLE: FixCategory.SUGGEST,
     IssueType.MISSING_ALT_TEXT: FixCategory.HUMAN_REVIEW,
     IssueType.FILEPATH_ALT_TEXT: FixCategory.HUMAN_REVIEW,
+    IssueType.ALT_TEXT_REDUNDANT_PREFIX: FixCategory.SUGGEST,
+    IssueType.ALT_TEXT_TOO_LONG: FixCategory.HUMAN_REVIEW,
+    IssueType.DECORATIVE_IMAGE_HAS_ALT: FixCategory.SAFE_AUTO,
     IssueType.TABLE_NO_HEADER: FixCategory.SAFE_AUTO,
     IssueType.TABLE_COMPLEX: FixCategory.HUMAN_REVIEW,
+    IssueType.TABLE_MERGED_CELLS: FixCategory.HUMAN_REVIEW,
+    IssueType.TABLE_EMPTY_CELLS: FixCategory.SUGGEST,
     IssueType.WEAK_LINK_TEXT: FixCategory.HUMAN_REVIEW,
     IssueType.MISSING_FOOTNOTE_LINK: FixCategory.SUGGEST,
     IssueType.COLOR_ONLY_INFO: FixCategory.HUMAN_REVIEW,
@@ -84,6 +107,7 @@ ISSUE_DEFAULT_FIX: dict[IssueType, FixCategory] = {
     IssueType.SMALL_FONT_SIZE: FixCategory.SAFE_AUTO,
     IssueType.EMPTY_SPACER_PARAGRAPH: FixCategory.SAFE_AUTO,
     IssueType.UNSPACED_SUPERSCRIPT: FixCategory.SAFE_AUTO,
+    IssueType.TEXT_JUSTIFIED: FixCategory.SAFE_AUTO,
     IssueType.SLIDE_MISSING_TITLE: FixCategory.SAFE_AUTO,
     IssueType.SLIDE_READING_ORDER: FixCategory.HUMAN_REVIEW,
 }
@@ -95,9 +119,13 @@ WEAK_LINK_PATTERNS: list[str] = [
     "link",
     "read more",
     "more",
+    "more info",
+    "more information",
     "learn more",
+    "see here",
     "this link",
     "this page",
+    "web page",
 ]
 
 

@@ -440,6 +440,8 @@ class ImageInspectionItem:
     current_alt: str
     is_decorative: bool
     location: str
+    has_redundant_prefix: bool = False
+    is_too_long: bool = False
 
 
 @dataclass
@@ -471,6 +473,8 @@ class TableInspectionItem:
     first_row_headers: list[str]
     has_header_flag: bool
     category_rows_count: int
+    has_merged_cells: bool = False
+    empty_cell_count: int = 0
 
 
 @dataclass
@@ -481,6 +485,7 @@ class FormattingHygieneSummary:
     zero_width_char_paras: list[int] = field(default_factory=list)
     unspaced_superscripts_count: int = 0
     unspaced_superscript_examples: list[str] = field(default_factory=list)
+    justified_paras: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -598,6 +603,14 @@ def inspect_document(file_path: str) -> DocumentInspection:
                         img_bytes = b""
                 break
 
+            has_red_pref = bool(
+                alt_text
+                and re.match(
+                    r"^\s*(?:an?\s+|the\s+)?(?:image|picture|photo|photograph|graphic|icon|screenshot)\s+of\s+",
+                    alt_text,
+                    re.IGNORECASE,
+                )
+            )
             images.append(
                 ImageInspectionItem(
                     index=img_counter,
@@ -608,12 +621,16 @@ def inspect_document(file_path: str) -> DocumentInspection:
                     current_alt=alt_text,
                     is_decorative=is_dec,
                     location=f"Paragraph {p_idx}",
+                    has_redundant_prefix=has_red_pref,
+                    is_too_long=len(alt_text) > 141,
                 )
             )
 
     # 2. Inspect headings & paragraph styles
     headings_and_styles: list[ParagraphStyleItem] = []
     last_h_level = 0
+    h_seen = 0
+    h1_seen = 0
     for p_idx, p in enumerate(doc.paragraphs, start=1):
         txt = p.text.strip()
         s_name = p.style.name if p.style else "Normal"
@@ -621,11 +638,36 @@ def inspect_document(file_path: str) -> DocumentInspection:
             continue
 
         if s_name.startswith("Heading"):
+            h_seen += 1
             try:
                 lvl = int(s_name.replace("Heading", "").strip())
             except ValueError:
                 lvl = 1
-            if last_h_level > 0 and lvl > last_h_level + 1:
+            if h_seen == 1 and lvl > 1:
+                headings_and_styles.append(
+                    ParagraphStyleItem(
+                        para_index=p_idx,
+                        text_preview=txt[:90],
+                        current_style=s_name,
+                        issue_kind="first_heading_not_h1",
+                        recommended_style="Heading 1",
+                        reason=f"First heading is {s_name}; documents should begin with a single Heading 1.",
+                    )
+                )
+            elif lvl == 1:
+                h1_seen += 1
+                if h1_seen > 1:
+                    headings_and_styles.append(
+                        ParagraphStyleItem(
+                            para_index=p_idx,
+                            text_preview=txt[:90],
+                            current_style=s_name,
+                            issue_kind="multiple_h1",
+                            recommended_style="Heading 2",
+                            reason="Document already has a Heading 1; use Heading 2 for major sections.",
+                        )
+                    )
+            elif last_h_level > 0 and lvl > last_h_level + 1:
                 headings_and_styles.append(
                     ParagraphStyleItem(
                         para_index=p_idx,
@@ -726,6 +768,28 @@ def inspect_document(file_path: str) -> DocumentInspection:
             fill = shd.get(f"{{{W_NS}}}fill", "") if shd is not None else ""
             if fill.upper() in ("A3B8CD", "CFDAE5"):
                 cat_rows += 1
+        has_merged = False
+        for gs in tbl._tbl.findall(f".//{{{W_NS}}}gridSpan"):
+            raw_span = gs.get(f"{{{W_NS}}}val") or gs.get("val", "1")
+            try:
+                if int(raw_span) > 1:
+                    has_merged = True
+                    break
+            except ValueError:
+                pass
+        if not has_merged and tbl._tbl.findall(f".//{{{W_NS}}}vMerge"):
+            has_merged = True
+
+        empty_cnt = 0
+        non_empty_cnt = 0
+        for tr in rows:
+            for tc in tr.findall(f"{{{W_NS}}}tc"):
+                c_txt = "".join(t.text for t in tc.findall(f".//{{{W_NS}}}t") if t.text).strip()
+                if c_txt:
+                    non_empty_cnt += 1
+                else:
+                    empty_cnt += 1
+
         tables.append(
             TableInspectionItem(
                 table_index=t_idx,
@@ -734,6 +798,8 @@ def inspect_document(file_path: str) -> DocumentInspection:
                 first_row_headers=first_headers,
                 has_header_flag=has_hdr,
                 category_rows_count=cat_rows,
+                has_merged_cells=has_merged,
+                empty_cell_count=empty_cnt if non_empty_cnt > 0 else 0,
             )
         )
 
@@ -752,6 +818,13 @@ def inspect_document(file_path: str) -> DocumentInspection:
         has_drawing = len(p._element.findall(f".//{{{W_NS}}}drawing")) > 0
         if not p.text.strip() and not has_drawing:
             hygiene.empty_spacer_paras.append(p_idx)
+        p_pr = p._element.find(f"{{{W_NS}}}pPr")
+        if p_pr is not None and p.text.strip():
+            jc = p_pr.find(f"{{{W_NS}}}jc")
+            if jc is not None:
+                jc_val = (jc.get(f"{{{W_NS}}}val") or jc.get("val", "")).lower()
+                if jc_val in ("both", "distribute", "justify"):
+                    hygiene.justified_paras.append(p_idx)
         if any(ch in p.text for ch in ("\u200c", "\u200b", "\ufeff")):
             hygiene.zero_width_char_paras.append(p_idx)
         for r in p.runs:
@@ -944,6 +1017,7 @@ def apply_interactive_remediation(
             for dp in drawing.findall(f".//{{{WP_NS}}}docPr"):
                 if is_dec:
                     dp.set("descr", "")
+                    dp.set("title", "")
                     has_dec = any(
                         el.get("val") in ("1", "true")
                         for el in dp.iter(f"{{{ADEC_NS}}}decorative")
@@ -1132,6 +1206,15 @@ def apply_interactive_remediation(
             if pPr is not None:
                 for numPr in pPr.findall(f"{{{W_NS}}}numPr"):
                     pPr.remove(numPr)
+
+        # Convert justified alignment to left-aligned for cognitive accessibility
+        p_pr_align = p._element.find(f"{{{W_NS}}}pPr")
+        if p_pr_align is not None:
+            jc_el = p_pr_align.find(f"{{{W_NS}}}jc")
+            if jc_el is not None:
+                jc_v = (jc_el.get(f"{{{W_NS}}}val") or jc_el.get("val", "")).lower()
+                if jc_v in ("both", "distribute", "justify"):
+                    jc_el.set(qn("w:val"), "left")
 
         if plan.enforce_min_font_size:
             p_style_name = p.style.name if p.style else "Normal"

@@ -8,7 +8,11 @@ import sys
 import click
 
 from ada_platform.scanner.docx_scanner import DocxScanner
+from ada_platform.scanner.html_scanner import HtmlScanner
+from ada_platform.scanner.pdf_scanner import PdfScanner
 from ada_platform.fixer.docx_fixer import DocxFixer
+from ada_platform.fixer.html_fixer import HtmlFixer
+from ada_platform.fixer.pdf_fixer import PdfFixer
 from ada_platform.metadata.excel_reader import ExcelMetadataReader, create_template_workbook
 from ada_platform.charts.chart_engine import ChartSpec, generate_chart_accessibility, read_csv_data
 from ada_platform.reporting.exception_report import (
@@ -35,13 +39,19 @@ def cli():
 @click.option("--metadata", "-m", type=click.Path(exists=True), help="Excel metadata workbook")
 @click.option("--output", "-o", type=click.Path(), help="Output report path (JSON)")
 def scan(file_path: str, metadata: str | None, output: str | None):
-    """Scan a DOCX file for accessibility issues."""
+    """Scan a DOCX or HTML file for accessibility issues."""
     meta_wb = None
     if metadata:
         meta_wb = ExcelMetadataReader().read(metadata)
         click.echo(f"Loaded metadata from {metadata}")
 
-    scanner = DocxScanner()
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in (".html", ".htm"):
+        scanner = HtmlScanner()
+    elif ext == ".pdf":
+        scanner = PdfScanner()
+    else:
+        scanner = DocxScanner()
     result = scanner.scan(file_path, metadata=meta_wb)
 
     click.echo()
@@ -55,19 +65,28 @@ def scan(file_path: str, metadata: str | None, output: str | None):
 @cli.command()
 @click.argument("file_path", type=click.Path(exists=True))
 @click.option("--metadata", "-m", type=click.Path(exists=True), help="Excel metadata workbook")
-@click.option("--output", "-o", type=click.Path(), help="Output DOCX path", required=True)
+@click.option("--output", "-o", type=click.Path(), help="Output file path", required=True)
 @click.option("--report", "-r", type=click.Path(), help="Output report path (JSON)")
 def fix(file_path: str, metadata: str | None, output: str, report: str | None):
-    """Scan and fix a DOCX file, saving the remediated version."""
+    """Scan and fix a DOCX or HTML file, saving the remediated version."""
     meta_wb = None
     if metadata:
         meta_wb = ExcelMetadataReader().read(metadata)
         click.echo(f"Loaded metadata from {metadata}")
 
-    scanner = DocxScanner()
+    ext = os.path.splitext(file_path)[1].lower()
+    is_docx = ext not in (".html", ".htm", ".pdf")
+    if ext in (".html", ".htm"):
+        scanner = HtmlScanner()
+        fixer = HtmlFixer()
+    elif ext == ".pdf":
+        scanner = PdfScanner()
+        fixer = PdfFixer()
+    else:
+        scanner = DocxScanner()
+        fixer = DocxFixer()
     scan_result = scanner.scan(file_path, metadata=meta_wb)
 
-    fixer = DocxFixer()
     fix_result = fixer.fix(file_path, output, scan_result, metadata=meta_wb)
 
     click.echo()
@@ -78,14 +97,15 @@ def fix(file_path: str, metadata: str | None, output: str, report: str | None):
         generate_json_report(fix_result, report)
         click.echo(f"JSON report saved to {report}")
 
-    # Screen reader QI check
-    t = generate_transcript(output)
-    if t.warnings:
-        click.echo(f"\nScreen reader QI: {t.summary()}")
-        for w in t.warnings:
-            click.echo(f"  [{w.location}] {w.text}")
-    else:
-        click.echo(f"\nScreen reader QI: {t.summary()}")
+    # Screen reader QI check (for DOCX)
+    if is_docx:
+        t = generate_transcript(output)
+        if t.warnings:
+            click.echo(f"\nScreen reader QI: {t.summary()}")
+            for w in t.warnings:
+                click.echo(f"  [{w.location}] {w.text}")
+        else:
+            click.echo(f"\nScreen reader QI: {t.summary()}")
 
 
 @cli.command()

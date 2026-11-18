@@ -46,7 +46,9 @@ class DocxFixer(BaseFixer):
                 continue
 
             if issue.fix_category == FixCategory.SAFE_AUTO and (
-                issue.suggested_fix or issue.issue_type == IssueType.TABLE_NO_HEADER
+                issue.suggested_fix
+                or issue.issue_type
+                in (IssueType.TABLE_NO_HEADER, IssueType.DECORATIVE_IMAGE_HAS_ALT)
             ):
                 success = self._apply_fix(doc, issue)
                 if success:
@@ -79,7 +81,10 @@ class DocxFixer(BaseFixer):
             IssueType.MISSING_LANGUAGE: self._fix_language,
             IssueType.MISSING_ALT_TEXT: self._fix_alt_text,
             IssueType.FILEPATH_ALT_TEXT: self._fix_alt_text,
+            IssueType.ALT_TEXT_REDUNDANT_PREFIX: self._fix_alt_text,
+            IssueType.DECORATIVE_IMAGE_HAS_ALT: self._fix_decorative_image,
             IssueType.TABLE_NO_HEADER: self._fix_table_header,
+            IssueType.TEXT_JUSTIFIED: self._fix_text_justified,
         }
         handler = handlers.get(issue.issue_type)
         if handler is None:
@@ -147,6 +152,38 @@ class DocxFixer(BaseFixer):
             dp.set("descr", issue.suggested_fix)
             break
 
+    def _fix_decorative_image(self, doc: Document, issue: Issue) -> None:
+        """Ensure decorative image has descr='' and <adec:decorative val='1'/>."""
+        position = self._parse_position(issue.location)
+        if position is None:
+            return
+        body = doc.element
+        drawings = body.findall(f".//{_qn('w:drawing')}")
+        if position > len(drawings):
+            return
+        drawing = drawings[position - 1]
+        a_ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+        adec_ns = "http://schemas.microsoft.com/office/drawing/2017/decorative"
+        for dp in drawing.findall(f".//{{{WP_NS}}}docPr"):
+            dp.set("descr", "")
+            dp.set("title", "")
+            has_dec = any(
+                el.get("val") in ("1", "true")
+                for el in dp.iter(f"{{{adec_ns}}}decorative")
+            )
+            if not has_dec:
+                ext_lst = dp.find(f"{{{a_ns}}}extLst")
+                if ext_lst is None:
+                    ext_lst = etree.SubElement(dp, f"{{{a_ns}}}extLst")
+                ext = etree.SubElement(
+                    ext_lst,
+                    f"{{{a_ns}}}ext",
+                    uri="{C183D7F6-B498-43B3-948B-1728B52AA6E4}",
+                )
+                dec = etree.SubElement(ext, f"{{{adec_ns}}}decorative")
+                dec.set("val", "1")
+            break
+
     def _fix_table_header(self, doc: Document, issue: Issue) -> None:
         """Mark the first row of a table as a header row."""
         position = self._parse_position(issue.location)
@@ -171,6 +208,18 @@ class DocxFixer(BaseFixer):
         existing = tr_pr.find(_qn("w:tblHeader"))
         if existing is None:
             etree.SubElement(tr_pr, _qn("w:tblHeader"))
+
+    def _fix_text_justified(self, doc: Document, issue: Issue) -> None:
+        """Convert justified paragraph alignment to left-aligned."""
+        position = self._parse_position(issue.location)
+        if position is None or position > len(doc.paragraphs):
+            return
+        para = doc.paragraphs[position - 1]
+        p_pr = para._element.find(_qn("w:pPr"))
+        if p_pr is not None:
+            jc = p_pr.find(_qn("w:jc"))
+            if jc is not None:
+                jc.set(_qn("w:val"), "left")
 
     def _parse_position(self, location: str) -> Optional[int]:
         """Extract position number from location string like 'Image 3' or 'Table 1'."""

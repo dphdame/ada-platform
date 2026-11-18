@@ -1,6 +1,32 @@
-# ADA Document & Tagged PDF Compliance Platform
+# ADA Document & Tagged PDF Compliance Platform (`ada-platform`)
 
-Deterministic, zero-AI WCAG 2.1 AA and Tagged PDF remediation platform for Word (`.docx`) and PDF (`.pdf`) deliverables.
+Deterministic, zero-AI WCAG 2.1 AA and Tagged PDF remediation platform for Word (`.docx`), PDF (`.pdf`), and Drupal / CMS HTML (`.html`) deliverables.
+
+- **Case Study Article:** [What Should Be AI, What Should Be Code, and What Needs a Human?](https://tooearlytosay.com/research/methodology/what-should-be-ai-code-or-human-ada-case-study/)
+- **Optional AI-Augmented Skill (`SKILL.md`):** [Download `ada-compliance-skill.md`](https://tooearlytosay.com/tools/templates/raw/ada-compliance-skill.md) (for drafting `<= 141`-char alt text and rewriting vague links in Claude Code, Cursor, or Antigravity before running this deterministic fixer).
+
+## Quick Start (macOS, Linux, or Windows CLI + Web UI)
+
+```bash
+git clone https://github.com/dphdame/ada-platform.git
+cd ada-platform
+python3 -m venv .venv && .venv/bin/pip install -e .
+
+# 1. Scan & auto-fix a Word document (.docx)
+ada-platform scan draft_brief.docx
+ada-platform fix draft_brief.docx -o brief_accessible.docx
+
+# 2. Scan & auto-fix a PDF (.pdf) — 16-check Adobe Acrobat Pro Full Check equivalent
+ada-platform scan report.pdf
+ada-platform fix report.pdf -o report_accessible.pdf
+
+# 3. Scan & auto-fix a Drupal web page or HTML snippet (.html)
+ada-platform scan service_page.html
+ada-platform fix service_page.html -o service_page_accessible.html
+
+# 4. Launch the interactive local Streamlit web application
+ada-platform ui
+```
 
 ## Key Capabilities (100% Deterministic Python — Zero Generative AI)
 

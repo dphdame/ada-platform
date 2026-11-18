@@ -269,6 +269,28 @@ class TestDocxScannerHeadings:
         skip_issues = [i for i in result.issues if i.issue_type == IssueType.HEADING_SKIP]
         assert len(skip_issues) == 0
 
+    def test_first_heading_not_h1_detected(self, tmp_path):
+        doc = Document()
+        doc.core_properties.title = "Test"
+        doc.add_heading("Section Starting At H2", level=2)
+        path = _save(doc, str(tmp_path))
+        result = DocxScanner().scan(path)
+        issues = [i for i in result.issues if i.issue_type == IssueType.HEADING_FIRST_NOT_H1]
+        assert len(issues) == 1
+        assert issues[0].suggested_fix == "Heading 1"
+
+    def test_multiple_h1_detected(self, tmp_path):
+        doc = Document()
+        doc.core_properties.title = "Test"
+        doc.add_heading("First Title", level=1)
+        doc.add_paragraph("Body.")
+        doc.add_heading("Second Title Also H1", level=1)
+        path = _save(doc, str(tmp_path))
+        result = DocxScanner().scan(path)
+        issues = [i for i in result.issues if i.issue_type == IssueType.HEADING_MULTIPLE_H1]
+        assert len(issues) == 1
+        assert issues[0].suggested_fix == "Heading 2"
+
 
 class TestDocxScannerAltText:
     def test_missing_alt_text_detected(self, tmp_path):
@@ -299,6 +321,49 @@ class TestDocxScannerAltText:
             if issue.suggested_fix:
                 assert issue.fix_category == FixCategory.SAFE_AUTO
 
+    def test_redundant_alt_prefix_and_long_alt_detected(self, tmp_path):
+        doc = _make_doc_with_image_no_alt(str(tmp_path))
+        wp_ns = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+        # 142 chars (> 141 Siteimprove max)
+        long_desc = "Image of " + ("a" * 133)
+        assert len(long_desc) == 142
+        for dp in doc.element.findall(f".//{{{wp_ns}}}docPr"):
+            dp.set("descr", long_desc)
+        path = _save(doc, str(tmp_path))
+        result = DocxScanner().scan(path)
+        pref_issues = [i for i in result.issues if i.issue_type == IssueType.ALT_TEXT_REDUNDANT_PREFIX]
+        long_issues = [i for i in result.issues if i.issue_type == IssueType.ALT_TEXT_TOO_LONG]
+        assert len(pref_issues) == 1
+        assert len(long_issues) == 1
+
+    def test_decorative_image_must_have_empty_alt_and_auto_fixes(self, tmp_path):
+        from ada_platform.fixer.docx_fixer import DocxFixer
+
+        doc = _make_doc_with_image_no_alt(str(tmp_path))
+        wp_ns = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+        for dp in doc.element.findall(f".//{{{wp_ns}}}docPr"):
+            dp.set("descr", "decorative")
+        in_path = _save(doc, str(tmp_path), "dec_bad.docx")
+        out_path = str(tmp_path / "dec_fixed.docx")
+
+        result = DocxScanner().scan(in_path)
+        dec_issues = [i for i in result.issues if i.issue_type == IssueType.DECORATIVE_IMAGE_HAS_ALT]
+        assert len(dec_issues) == 1
+        assert dec_issues[0].suggested_fix == ""
+
+        fix_res = DocxFixer().fix(in_path, out_path, result)
+        assert any(i.issue_type == IssueType.DECORATIVE_IMAGE_HAS_ALT for i in fix_res.auto_fixed)
+
+        # Verify output has descr="" and zero issues on rescan
+        fixed_doc = Document(out_path)
+        for dp in fixed_doc.element.findall(f".//{{{wp_ns}}}docPr"):
+            assert dp.get("descr") == ""
+        rescan = DocxScanner().scan(out_path)
+        assert not any(
+            i.issue_type in (IssueType.DECORATIVE_IMAGE_HAS_ALT, IssueType.MISSING_ALT_TEXT)
+            for i in rescan.issues
+        )
+
 
 class TestDocxScannerTables:
     def test_table_no_header_detected(self, tmp_path):
@@ -318,6 +383,33 @@ class TestDocxScannerTables:
             if i.issue_type in (IssueType.TABLE_NO_HEADER, IssueType.TABLE_COMPLEX)
         ]
         assert len(table_issues) == 0
+
+    def test_table_merged_and_empty_cells_detected(self, tmp_path):
+        doc = _make_doc_with_table_header()
+        table = doc.tables[0]
+        # Make one cell empty
+        table.cell(1, 1).text = ""
+        # Merge top row cells horizontally
+        table.cell(0, 0).merge(table.cell(0, 1))
+        path = _save(doc, str(tmp_path))
+        result = DocxScanner().scan(path)
+        merged_issues = [i for i in result.issues if i.issue_type == IssueType.TABLE_MERGED_CELLS]
+        empty_issues = [i for i in result.issues if i.issue_type == IssueType.TABLE_EMPTY_CELLS]
+        assert len(merged_issues) == 1
+        assert len(empty_issues) == 1
+        assert empty_issues[0].suggested_fix == "NA"
+
+    def test_justified_text_detected(self, tmp_path):
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+        doc = _make_clean_doc()
+        p = doc.add_paragraph("This paragraph is justified and should be flagged.")
+        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        path = _save(doc, str(tmp_path))
+        result = DocxScanner().scan(path)
+        just_issues = [i for i in result.issues if i.issue_type == IssueType.TEXT_JUSTIFIED]
+        assert len(just_issues) == 1
+        assert just_issues[0].suggested_fix == "left"
 
 
 class TestDocxScannerLinks:

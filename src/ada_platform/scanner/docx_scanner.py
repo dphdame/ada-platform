@@ -38,9 +38,21 @@ _URL_PATTERN = re.compile(r"^https?://", re.IGNORECASE)
 
 # File path pattern for detecting file paths in alt text
 _FILEPATH_PATTERN = re.compile(
-    r"[\\/]|\.(?:png|jpg|jpeg|gif|bmp|tiff|svg|webp|emf|wmf)$",
+    r"(?:^|[\s\"'])(?:[A-Za-z]:\\|/(?:Users|tmp|var|home|sites|images|assets|figures)/|(?:figures|assets|images|media|uploads)/|\S+\.(?:png|jpg|jpeg|gif|bmp|tiff|svg|webp|emf|wmf)\b)",
     re.IGNORECASE,
 )
+
+# Redundant prefix pattern in alt text (Siteimprove & County Digital Accessibility standard)
+_REDUNDANT_ALT_PREFIX_RE = re.compile(
+    r"^\s*(?:an?\s+|the\s+)?(?:image|picture|photo|photograph|graphic|icon|screenshot)\s+of\s+",
+    re.IGNORECASE,
+)
+
+# Maximum character count for regular alt text (Siteimprove / County standard: 125 target, 141 hard max)
+_MAX_REGULAR_ALT_LENGTH = 141
+
+# Literal tokens that authors mistakenly type into alt text instead of setting empty "" + decorative
+_DECORATIVE_LITERAL_TOKENS = {"decorative", "[decorative]", "decoration", "null", '""', "''"}
 
 
 def _qn(tag: str) -> str:
@@ -76,6 +88,7 @@ class DocxScanner(BaseScanner):
         link_issues, link_count = self._check_links(doc, metadata)
         issues.extend(link_issues)
 
+        issues.extend(self._check_alignment(doc))
         issues.extend(self._check_colors(doc))
 
         return ScanResult(
@@ -164,6 +177,7 @@ class DocxScanner(BaseScanner):
         issues: list[Issue] = []
         heading_count = 0
         last_level = 0
+        h1_count = 0
 
         for i, para in enumerate(doc.paragraphs, start=1):
             style_name = para.style.name if para.style else ""
@@ -175,6 +189,37 @@ class DocxScanner(BaseScanner):
                     level = int(style_name.replace("Heading", "").strip())
                 except ValueError:
                     continue
+
+                if heading_count == 1 and level > 1:
+                    issues.append(
+                        Issue.create(
+                            IssueType.HEADING_FIRST_NOT_H1,
+                            location=f"Paragraph {i}",
+                            description=(
+                                f"First heading is Heading {level}. Documents should "
+                                f"begin with a single Heading 1 for the main title."
+                            ),
+                            current_value=f"Heading {level}",
+                            suggested_fix="Heading 1",
+                        )
+                    )
+
+                if level == 1:
+                    h1_count += 1
+                    if h1_count > 1:
+                        issues.append(
+                            Issue.create(
+                                IssueType.HEADING_MULTIPLE_H1,
+                                location=f"Paragraph {i}",
+                                description=(
+                                    "Document contains multiple Heading 1 paragraphs. "
+                                    "Use a single Heading 1 for the document title and "
+                                    "Heading 2 for major sections."
+                                ),
+                                current_value="Heading 1",
+                                suggested_fix="Heading 2",
+                            )
+                        )
 
                 if last_level > 0 and level > last_level + 1:
                     issues.append(
@@ -250,7 +295,37 @@ class DocxScanner(BaseScanner):
                 break
 
             if is_decorative:
-                continue  # In-place decorative images are skipped by screen readers
+                if alt_text:
+                    issues.append(
+                        Issue.create(
+                            IssueType.DECORATIVE_IMAGE_HAS_ALT,
+                            location=f"Image {position}",
+                            description=(
+                                f'Image {position} is marked decorative but still has '
+                                f'non-empty alt text ("{alt_text}"). Decorative images '
+                                f'must have an empty description ("") so screen readers skip them.'
+                            ),
+                            current_value=alt_text,
+                            suggested_fix="",
+                        )
+                    )
+                continue  # In-place decorative images with "" are skipped by screen readers
+
+            if alt_text.lower() in _DECORATIVE_LITERAL_TOKENS:
+                issues.append(
+                    Issue.create(
+                        IssueType.DECORATIVE_IMAGE_HAS_ALT,
+                        location=f"Image {position}",
+                        description=(
+                            f'Image {position} has literal "{alt_text}" as its description. '
+                            f'Decorative images must have an empty description ("") and be '
+                            f"marked decorative so screen readers do not read the word aloud."
+                        ),
+                        current_value=alt_text,
+                        suggested_fix="",
+                    )
+                )
+                continue
 
             # Try to get the embedded image filename from blipFill
             embedded_name = ""
@@ -351,10 +426,48 @@ class DocxScanner(BaseScanner):
                         suggested_fix=suggested,
                     )
                 )
+            else:
+                # Check for redundant "image of" / "photo of" / "picture of" prefix
+                m_pref = _REDUNDANT_ALT_PREFIX_RE.match(alt_text)
+                if m_pref:
+                    remainder = alt_text[m_pref.end() :].strip()
+                    cleaned = (
+                        remainder[0].upper() + remainder[1:]
+                        if remainder
+                        else alt_text
+                    )
+                    issues.append(
+                        Issue.create(
+                            IssueType.ALT_TEXT_REDUNDANT_PREFIX,
+                            location=f"Image {position}",
+                            description=(
+                                f'Image {position} description starts with a redundant '
+                                f'phrase ("{m_pref.group(0).strip()}"). Screen readers '
+                                f"already announce that an element is an image."
+                            ),
+                            current_value=alt_text,
+                            suggested_fix=cleaned,
+                        )
+                    )
+
+                if len(alt_text) > _MAX_REGULAR_ALT_LENGTH:
+                    issues.append(
+                        Issue.create(
+                            IssueType.ALT_TEXT_TOO_LONG,
+                            location=f"Image {position}",
+                            description=(
+                                f"Image {position} description is {len(alt_text)} characters "
+                                f"(recommended concise limit is under {_MAX_REGULAR_ALT_LENGTH} "
+                                f"characters). Keep alt text concise and place detailed chart "
+                                f"or infographic data in the surrounding text or a table."
+                            ),
+                            current_value=alt_text,
+                        )
+                    )
 
         return issues, image_count
 
-    # ── Check 5: Table headers ───────────────────────────────────
+    # ── Check 5: Table headers, merged cells & empty cells ───────
 
     def _check_tables(
         self,
@@ -407,6 +520,59 @@ class DocxScanner(BaseScanner):
                             f"Table {position} does not mark its first "
                             f"row as a header row."
                         ),
+                    )
+                )
+
+            # Check for merged cells (horizontal gridSpan > 1 or vertical vMerge)
+            has_merged = False
+            for gs in tbl_xml.findall(f".//{_qn('w:gridSpan')}"):
+                raw_span = gs.get(_qn("w:val")) or gs.get("val", "1")
+                try:
+                    if int(raw_span) > 1:
+                        has_merged = True
+                        break
+                except ValueError:
+                    pass
+            if not has_merged and tbl_xml.findall(f".//{_qn('w:vMerge')}"):
+                has_merged = True
+
+            if has_merged:
+                issues.append(
+                    Issue.create(
+                        IssueType.TABLE_MERGED_CELLS,
+                        location=f"Table {position}",
+                        description=(
+                            f"Table {position} contains merged cells. Screen readers "
+                            f"lose row and column context when cells are merged; "
+                            f"split merged cells into a simple flat grid."
+                        ),
+                    )
+                )
+
+            # Check for empty cells in populated tables (County standard: use "NA" or "no data")
+            non_empty_cells = 0
+            empty_cells = 0
+            for tr in rows:
+                for tc in tr.findall(_qn("w:tc")):
+                    cell_text = "".join(
+                        t.text for t in tc.findall(f".//{_qn('w:t')}") if t.text
+                    ).strip()
+                    if cell_text:
+                        non_empty_cells += 1
+                    else:
+                        empty_cells += 1
+
+            if non_empty_cells > 0 and empty_cells > 0:
+                issues.append(
+                    Issue.create(
+                        IssueType.TABLE_EMPTY_CELLS,
+                        location=f"Table {position}",
+                        description=(
+                            f"Table {position} has {empty_cells} blank cell(s). "
+                            f"Enter 'NA' or 'no data' in empty cells so screen reader "
+                            f"users know no value was accidentally skipped."
+                        ),
+                        suggested_fix="NA",
                     )
                 )
 
@@ -484,6 +650,36 @@ class DocxScanner(BaseScanner):
             )
 
         return issues, link_count
+
+    # ── Check 6b: Text alignment (no justified body text) ────────
+
+    def _check_alignment(self, doc: Document) -> list[Issue]:
+        issues: list[Issue] = []
+        for p_idx, para in enumerate(doc.paragraphs, start=1):
+            if not para.text.strip():
+                continue
+            p_pr = para._element.find(_qn("w:pPr"))
+            if p_pr is None:
+                continue
+            jc = p_pr.find(_qn("w:jc"))
+            if jc is None:
+                continue
+            val = (jc.get(_qn("w:val")) or jc.get("val", "")).lower()
+            if val in ("both", "distribute", "justify"):
+                issues.append(
+                    Issue.create(
+                        IssueType.TEXT_JUSTIFIED,
+                        location=f"Paragraph {p_idx}",
+                        description=(
+                            f"Paragraph {p_idx} uses justified alignment, which "
+                            f"creates uneven spacing between words for readers with "
+                            f"dyslexia or low vision. Use left-aligned text instead."
+                        ),
+                        current_value="justified",
+                        suggested_fix="left",
+                    )
+                )
+        return issues
 
     # ── Check 7: Color contrast & color-only prose ───────────────
 
